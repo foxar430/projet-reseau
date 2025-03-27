@@ -1,0 +1,111 @@
+import torch
+import numpy as np
+import os
+from lo3ba import DRLAgent, encode_simple_state
+
+class BattleshipAI:
+    def __init__(self, model_path="battleship_drl_model.pth"):
+        self.grid_size = 10
+        self.state_size = 170
+        self.action_size = 100
+        
+        # Initialize the DRL agent
+        self.agent = DRLAgent(state_size=self.state_size, action_size=self.action_size)
+        
+        # Load model if it exists
+        if os.path.exists(model_path):
+            success = self.agent.load_model(model_path)
+            if success:
+                print(f"AI loaded successfully from {model_path}")
+                self.agent.epsilon = 0.0  # No exploration during gameplay
+            else:
+                print(f"Failed to load AI model from {model_path}")
+        else:
+            print(f"Model file {model_path} not found. The AI will use default parameters.")
+    
+    def choose_shot(self, game_board):
+        """
+        Choose a shot based on the current game state
+        
+        Args:
+            game_board: A board object from the game with shots, hits, etc.
+            
+        Returns:
+            (row, col): Coordinates for the next shot
+        """
+        # Convert game board to the format expected by the AI
+        state = self.encode_game_board(game_board)
+        
+        # Get valid actions (cells not yet shot at)
+        valid_actions = self.get_valid_actions(game_board)
+        
+        if not valid_actions:
+            # Fallback if somehow we have no valid actions
+            return (0, 0)
+        
+        # Use the agent to choose an action
+        self.agent.epsilon = 0.0  # Ensure no random exploration during gameplay
+        action = self.agent.act(state, valid_actions)
+        
+        return action
+    
+    def encode_game_board(self, game_board):
+        """
+        Convert the game board into a state representation for the AI
+        
+        This adapts the game UI's board representation to match our training format
+        """
+        # Create a simple wrapper/adapter for the game board
+        class BoardAdapter:
+            def __init__(self, game_board):
+                self.size = 10
+                self.shots = set()
+                self.hits = set()
+                self.misses = set()
+                self.sunk_ships = []
+                
+                # Extract data from the game board
+                for r in range(self.size):
+                    for c in range(self.size):
+                        if (r, c) in game_board.shots:
+                            self.shots.add((r, c))
+                            if game_board.grid[r][c] == 'X':
+                                self.hits.add((r, c))
+                            else:
+                                self.misses.add((r, c))
+                
+                # Add sunk ships info if available
+                self.sunk_ships = [ship for ship in game_board.ships if ship.sunk]
+        
+        # Create adapter and encode state
+        board_adapter = BoardAdapter(game_board)
+        return encode_simple_state(board_adapter)
+    
+    def get_valid_actions(self, game_board):
+        """Get all valid (not yet shot at) positions"""
+        valid = []
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if (r, c) not in game_board.shots:
+                    valid.append((r, c))
+        return valid
+
+# Example of how to use in the game:
+"""
+# In your game's main loop:
+from lo3ba_ai import BattleshipAI
+
+# Initialize AI
+ai = BattleshipAI()
+
+# During computer's turn:
+if current_player == AI_PLAYER:
+    # AI chooses a shot
+    row, col = ai.choose_shot(board)
+    
+    # Process the shot
+    result = board.receive_shot(row, col)
+    
+    # Handle result and switch players
+    # ...
+"""
