@@ -3,6 +3,7 @@ import random
 import sys
 import time
 import os
+from lo3ba_ai import BattleshipAI
 
 # Initialize Pygame
 pygame.init()
@@ -512,6 +513,8 @@ class Game:
         self.menu_buttons = [
             Button(250, 250, 500, 50, "Player vs Player", LIGHT_BLUE, BLUE, BLACK, 
                   lambda: self.start_pvp_game()),
+            Button(250, 300, 500, 50, "Player vs AI", LIGHT_BLUE, BLUE, BLACK, 
+                  lambda: self.start_ai_game()),
             Button(250, 350, 500, 50, "Start with Random Ship Placement", LIGHT_BLUE, BLUE, BLACK, 
                   lambda: self.start_random_game()),
             Button(250, 650, 500, 50, "Quit", RED, (200, 0, 0), WHITE, 
@@ -535,6 +538,28 @@ class Game:
         self.state = SETUP
         self.setup_complete = [False, False]
         self.message = "Player 1: Place your ships!"
+        self.message_timer = 3000
+        return True
+    
+    def start_ai_game(self):
+        """Start a game against the AI opponent"""
+        self.reset_game()
+        self.is_ai_game = True
+        self.ai_player = 2  # AI will be player 2
+        
+        # Initialize the AI with the trained model
+        model_path = "battleship_drl_model.pth"  # Use your best model here
+        if os.path.exists(model_path):
+            self.ai = BattleshipAI(model_path)
+            print(f"AI loaded from {model_path}")
+        else:
+            print(f"Warning: Model file {model_path} not found. Using default AI.")
+            self.ai = BattleshipAI()
+        
+        # Setup initial state - player 1 places ships first
+        self.state = SETUP
+        self.current_player = 1
+        self.message = "Place your ships against the AI opponent!"
         self.message_timer = 3000
         return True
     
@@ -595,6 +620,13 @@ class Game:
             Button(400, 400, 200, 50, "New Game", GREEN, (0, 220, 0), BLACK, 
                   lambda: self.new_game())
         ]
+        
+        # Add at the end of reset_game method
+        self.is_ai_game = False
+        self.ai = None
+        self.ai_player = None
+        self.ai_thinking = False
+        self.ai_move_timer = 0
     
     def rotate_ship(self):
         if self.selected_ship:
@@ -666,9 +698,19 @@ class Game:
                     if not remaining_ships:
                         self.setup_complete[self.current_player - 1] = True
                         if self.current_player == 1:
-                            self.current_player = 2
-                            self.message = "Player 2: Place your ships!"
-                            self.message_timer = 3000
+                            if self.is_ai_game:
+                                # AI setup - automatically place ships randomly
+                                self.board2.place_ships_randomly(self.ships2)
+                                self.setup_complete[1] = True
+                                self.state = GAMEPLAY
+                                self.current_player = 1
+                                self.message = "Game started! Your turn"
+                                self.message_timer = 3000
+                            else:
+                                # Regular PvP setup
+                                self.current_player = 2
+                                self.message = "Player 2: Place your ships!"
+                                self.message_timer = 3000
                         else:
                             self.state = GAMEPLAY
                             self.current_player = 1
@@ -687,6 +729,10 @@ class Game:
                     self.message_timer = 2000
     
     def handle_gameplay_click(self, pos):
+        # Add at the beginning of handle_gameplay_click
+        if self.is_ai_game and self.current_player == self.ai_player:
+            return  # Prevent player from taking actions during AI's turn
+
         # Determine which board to target
         target_board = self.board2 if self.current_player == 1 else self.board1
         
@@ -874,8 +920,8 @@ class Game:
             pygame.draw.rect(self.screen, color, (0, y, SCREEN_WIDTH, 1))
         
         # Draw player labels with shadow effect
-        player1_text = self.font.render("Player 1's Board", True, BLUE)
-        player2_text = self.font.render("Player 2's Board", True, BLUE)
+        player1_text = self.font.render("Your Board" if self.is_ai_game else "Player 1's Board", True, BLUE)
+        player2_text = self.font.render("AI's Board" if self.is_ai_game else "Player 2's Board", True, BLUE)
         
         # Draw label backgrounds
         label1_rect = pygame.Rect(GRID_PADDING + 20, 5, player1_text.get_width() + 60, 30)
@@ -897,14 +943,14 @@ class Game:
         self.screen.blit(player2_text, (SCREEN_WIDTH // 2 + GRID_PADDING + 50, 10))
         
         # Draw current player indicator
-        current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
-        indicator_rect = pygame.Rect(SCREEN_WIDTH // 2 - current_text.get_width() // 2 - 20, 
-                                   590, current_text.get_width() + 40, 50)
-        pygame.draw.rect(self.screen, (255, 240, 240), indicator_rect, 0, border_radius=10)
-        pygame.draw.rect(self.screen, RED, indicator_rect, 2, border_radius=10)
-        self.screen.blit(current_text, (SCREEN_WIDTH // 2 - current_text.get_width() // 2, 600))
-        
-        # Update and draw boards
+        current_text = None
+        if self.is_ai_game:
+            if self.current_player == 1:
+                current_text = self.big_font.render("Your Turn", True, RED)
+            else:
+                current_text = self.big_font.render("AI's Turn", True, RED)
+        else:
+            current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
         mouse_pos = pygame.mouse.get_pos()
         if self.current_player == 1:
             # When player 1's turn, update hover on player 2's board
@@ -931,6 +977,8 @@ class Game:
             pygame.draw.rect(self.screen, (255, 255, 200), msg_bg, 0, border_radius=5)
             pygame.draw.rect(self.screen, BLACK, msg_bg, 1, border_radius=5)
             self.screen.blit(msg_text, (SCREEN_WIDTH // 2 - msg_text.get_width() // 2, 655))
+        
+        self.screen.blit(current_text, (SCREEN_WIDTH // 2 - current_text.get_width() // 2, 600))
     
     def draw_game_over(self):
         # Create gradient background
@@ -952,8 +1000,16 @@ class Game:
         game_over_shadow = self.big_font.render("GAME OVER", True, BLACK)
         game_over_text = self.big_font.render("GAME OVER", True, RED)
         
-        winner_shadow = self.big_font.render(f"Player {self.winner} Wins!", True, BLACK)
-        winner_text = self.big_font.render(f"Player {self.winner} Wins!", True, BLUE)
+        # Update winner text in draw_game_over
+        if self.is_ai_game and self.winner == self.ai_player:
+            winner_text = self.big_font.render("AI Wins!", True, BLUE)
+            winner_shadow = self.big_font.render("AI Wins!", True, BLACK)
+        elif self.is_ai_game:
+            winner_text = self.big_font.render("You Win!", True, BLUE)
+            winner_shadow = self.big_font.render("You Win!", True, BLACK)
+        else:
+            winner_text = self.big_font.render(f"Player {self.winner} Wins!", True, BLUE)
+            winner_shadow = self.big_font.render(f"Player {self.winner} Wins!", True, BLACK)
         
         # Draw shadow text slightly offset
         self.screen.blit(game_over_shadow, (SCREEN_WIDTH // 2 - game_over_text.get_width() // 2 + 2, 202))
@@ -986,6 +1042,87 @@ class Game:
             else:
                 self.board1.update(dt)
                 self.board2.update(dt, mouse_pos)
+        
+        # Add this at the beginning of the update method after message timer code
+        # Around line 730-750
+        if self.state == GAMEPLAY and self.is_ai_game and self.current_player == self.ai_player:
+            # Add a delay to make the AI's move feel more natural
+            self.ai_move_timer += self.clock.get_time()
+            if self.ai_move_timer >= 800:  # 800ms delay
+                self.ai_move_timer = 0
+                self.make_ai_move()
+    
+    def make_ai_move(self):
+        """Execute the AI's turn"""
+        # Create board adapter for the AI
+        board_adapter = self.create_board_adapter(self.board1)
+        
+        # Get AI's choice of shot
+        row, col = self.ai.choose_shot(board_adapter)
+        
+        # Process the shot
+        result = self.board1.receive_shot(row, col)
+        
+        # Update message based on result
+        if result == "already_shot":
+            # This shouldn't happen with a properly trained AI
+            print("AI tried to shoot at an already targeted position!")
+            # Try again
+            self.make_ai_move()
+            return
+        elif result == "hit":
+            self.message = "AI hit your ship!"
+            self.message_timer = 2000
+        elif result == "miss":
+            self.message = "AI missed!"
+            self.message_timer = 2000
+            # Switch back to player's turn
+            self.current_player = 1
+        elif result.startswith("sunk"):
+            ship_name = result.split("_")[1]
+            self.message = f"AI sunk your {ship_name}!"
+            self.message_timer = 3000
+        
+        # Check for win condition
+        if self.board1.all_ships_sunk():
+            self.winner = self.ai_player
+            self.state = GAME_OVER
+    
+    def create_board_adapter(self, game_board):
+        """Create an adapter that converts the game board to AI format"""
+        class BoardAdapter:
+            def __init__(self, game_board):
+                self.size = 10
+                self.grid = game_board.grid
+                self.ships = game_board.ships
+                self.shots = set()
+                self.hits = set()
+                self.misses = set()
+                self.sunk_ships = []
+                
+                # Extract data from the game board
+                for r in range(self.size):
+                    for c in range(self.size):
+                        if (r, c) in game_board.shots:
+                            self.shots.add((r, c))
+                            if game_board.grid[r][c] == 'X':
+                                self.hits.add((r, c))
+                            elif game_board.grid[r][c] == 'M':
+                                self.misses.add((r, c))
+                
+                # Add sunk ships info
+                self.sunk_ships = [ship for ship in game_board.ships if ship.sunk]
+                
+            def get_valid_actions(self):
+                """Get all valid positions to shoot at"""
+                valid = []
+                for r in range(self.size):
+                    for c in range(self.size):
+                        if (r, c) not in self.shots:
+                            valid.append((r, c))
+                return valid
+        
+        return BoardAdapter(game_board)
     
     def run(self):
         while True:
