@@ -1,0 +1,862 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import random
+import time
+import matplotlib.pyplot as plt
+import os
+from collections import deque, namedtuple
+import copy
+import pickle
+
+# Set random seeds for reproducibility
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Check for CUDA
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Constants
+GRID_SIZE = 10
+MAX_SHOTS = 100
+MODEL_PATH = "battleship_drl_model.pth"
+STATS_PATH = "training_stats.pkl"
+
+# Ship configurations
+SHIPS = [
+    {"name": "Carrier", "size": 5},
+    {"name": "Battleship", "size": 4},
+    {"name": "Cruiser", "size": 3},
+    {"name": "Submarine", "size": 3},
+    {"name": "Destroyer", "size": 2}
+]
+
+# Experience replay memory
+Experience = namedtuple('Experience', 
+                       ['state', 'action', 'reward', 'next_state', 'done'])
+
+class ReplayMemory:
+    def __init__(self, capacity=100000):
+        self.memory = deque(maxlen=capacity)
+    
+    def push(self, experience):
+        self.memory.append(experience)
+    
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+    
+    def __len__(self):
+        return len(self.memory)
+
+class Board:
+    def __init__(self):
+        self.size = GRID_SIZE
+        self.grid = [['~' for _ in range(self.size)] for _ in range(self.size)]
+        self.ships = []
+        self.shots = set()
+        self.hits = set()
+        self.misses = set()
+        self.ship_coordinates = set()
+        self.sunk_ships = []
+    
+    def place_ship(self, ship, row, col, horizontal):
+        # Check if ship can be placed
+        coordinates = []
+        
+        if horizontal:
+            if col + ship["size"] > self.size:
+                return False
+            
+            # Check for overlaps
+            for i in range(ship["size"]):
+                if (row, col + i) in self.ship_coordinates:
+                    return False
+                coordinates.append((row, col + i))
+        else:
+            if row + ship["size"] > self.size:
+                return False
+            
+            # Check for overlaps
+            for i in range(ship["size"]):
+                if (row + i, col) in self.ship_coordinates:
+                    return False
+                coordinates.append((row + i, col))
+        
+        # Place ship
+        ship_instance = {
+            "name": ship["name"],
+            "size": ship["size"],
+            "coordinates": coordinates,
+            "hits": 0,
+            "sunk": False
+        }
+        
+        for r, c in coordinates:
+            self.grid[r][c] = 'O'
+            self.ship_coordinates.add((r, c))
+        
+        self.ships.append(ship_instance)
+        return True
+    
+    def place_ships_randomly(self):
+        self.grid = [['~' for _ in range(self.size)] for _ in range(self.size)]
+        self.ships = []
+        self.ship_coordinates = set()
+        
+        for ship in SHIPS:
+            placed = False
+            attempts = 0
+            while not placed and attempts < 100:
+                row = random.randint(0, self.size - 1)
+                col = random.randint(0, self.size - 1)
+                horizontal = random.choice([True, False])
+                placed = self.place_ship(ship, row, col, horizontal)
+                attempts += 1
+            
+            if not placed:
+                # If we can't place a ship after 100 attempts, start over
+                return self.place_ships_randomly()
+    
+    def receive_shot(self, row, col):
+        if (row, col) in self.shots:
+            return "already_shot", -2.0, False  # Stronger penalty
+        
+        self.shots.add((row, col))
+        
+        if (row, col) in self.ship_coordinates:
+            self.hits.add((row, col))
+            self.grid[row][col] = 'X'
+            
+            # Check which ship was hit
+            for ship in self.ships:
+                if (row, col) in ship["coordinates"]:
+                    ship["hits"] += 1
+                    
+                    # Check if ship is sunk
+                    if ship["hits"] == ship["size"]:
+                        ship["sunk"] = True
+                        self.sunk_ships.append(ship)
+                        return "sunk", 5.0 + (ship["size"] * 1.0), self.all_ships_sunk()  
+                    return "hit", 3.0, False  # Increased reward
+        else:
+            self.misses.add((row, col))
+            self.grid[row][col] = 'M'
+            return "miss", -0.8, False  # Increased penalty
+    
+    def all_ships_sunk(self):
+        """Check if all ships have been sunk"""
+        return len(self.sunk_ships) == len(SHIPS)
+
+    def reset(self):
+        """Reset the board for a new game"""
+        self.grid = [['~' for _ in range(self.size)] for _ in range(self.size)]
+        self.ships = []
+        self.shots = set()
+        self.hits = set()
+        self.misses = set()
+        self.ship_coordinates = set()
+        self.sunk_ships = []
+        self.place_ships_randomly()
+    
+    def get_valid_actions(self):
+        return [(r, c) for r in range(self.size) for c in range(self.size) 
+                if (r, c) not in self.shots]
+
+# Neural Network for DQN
+class DQN(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(DQN, self).__init__()
+        
+        # Network architecture
+        self.fc1 = nn.Linear(input_size, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, output_size)
+        
+        # Initialize weights
+        nn.init.kaiming_normal_(self.fc1.weight)
+        nn.init.kaiming_normal_(self.fc2.weight)
+        nn.init.kaiming_normal_(self.fc3.weight)
+        nn.init.kaiming_normal_(self.fc4.weight)
+    
+    def forward(self, x):
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
+
+def encode_state(board):
+    """Encode the board state for the DRL agent"""
+    state = np.zeros((3, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    
+    # Layer 0: Hits (1 for hit, 0 otherwise)
+    for r, c in board.hits:
+        state[0, r, c] = 1
+    
+    # Layer 1: Misses (1 for miss, 0 otherwise)
+    for r, c in board.misses:
+        state[1, r, c] = 1
+    
+    # Layer 2: Unknown cells (1 for unknown, 0 otherwise)
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            if (r, c) not in board.shots:
+                state[2, r, c] = 1
+    
+    # Flatten the state
+    return state.flatten()
+
+def encode_simple_state(board):
+    """Simplified but more informative state encoding"""
+    state = np.zeros(170, dtype=np.float32)
+    
+    # Part 1: Basic grid state (0=unknown, 1=miss, 2=hit) - 100 values
+    idx = 0
+    for r in range(board.size):
+        for c in range(board.size):
+            if (r, c) in board.shots:
+                if (r, c) in board.hits:
+                    state[idx] = 2  # Hit
+                else:
+                    state[idx] = 1  # Miss
+            idx += 1
+    
+    # Part 2: Patterns that indicate ship segments - 50 values
+    patterns = [
+        # Horizontal patterns of hits
+        [(0,0), (0,1)], [(0,0), (0,2)], 
+        # Vertical patterns of hits  
+        [(0,0), (1,0)], [(0,0), (2,0)],
+        # Corners of possible ships
+        [(0,0), (1,1)], [(0,1), (1,0)]
+    ]
+    
+    # Count how many times each pattern appears
+    pattern_features = np.zeros(50)
+    pattern_count = 0
+    
+    for pattern in patterns:
+        if pattern_count >= 50:
+            break
+            
+        # For each pattern type, count how many instances we found
+        matches_found = 0
+        for r in range(board.size-2):
+            for c in range(board.size-2):
+                # Check if pattern matches hits on the board
+                matches = True
+                for dr, dc in pattern:
+                    pos = (r+dr, c+dc)
+                    if pos[0] >= board.size or pos[1] >= board.size:
+                        matches = False
+                        break
+                    if pos not in board.hits:
+                        matches = False
+                        break
+                if matches:
+                    matches_found += 1
+        
+        # Store the count of this pattern (capped at 5)
+        pattern_features[pattern_count] = min(matches_found, 5)
+        pattern_count += 1
+    
+    # Combine the state representation
+    state[100:150] = pattern_features
+    
+    # Part 3: Distance metrics - 20 values
+    # Hit density and distribution features
+    if board.hits:
+        # How many hits we have
+        state[150] = len(board.hits) / board.size**2
+        
+        # Distances between hits
+        if len(board.hits) > 1:
+            hit_positions = list(board.hits)
+            closest = float('inf')
+            farthest = 0
+            for i in range(len(hit_positions)):
+                for j in range(i+1, len(hit_positions)):
+                    r1, c1 = hit_positions[i]
+                    r2, c2 = hit_positions[j]
+                    dist = abs(r1-r2) + abs(c1-c2)  # Manhattan distance
+                    closest = min(closest, dist)
+                    farthest = max(farthest, dist)
+            
+            state[151] = closest / (board.size*2)  # Normalize
+            state[152] = farthest / (board.size*2)  # Normalize
+    
+    # Shot density in each quadrant
+    q_idx = 153
+    for i in range(2):
+        for j in range(2):
+            hit_count = 0
+            miss_count = 0
+            shot_count = 0
+            for r in range(i*5, (i+1)*5):
+                for c in range(j*5, (j+1)*5):
+                    if (r, c) in board.shots:
+                        shot_count += 1
+                        if (r, c) in board.hits:
+                            hit_count += 1
+                        else:
+                            miss_count += 1
+            
+            state[q_idx] = shot_count / 25  # Normalized shot density
+            state[q_idx+1] = hit_count / max(1, shot_count)  # Hit ratio
+            state[q_idx+2] = miss_count / max(1, shot_count)  # Miss ratio
+            q_idx += 3
+    
+    # Number of sunk ships and remaining ships
+    state[165] = len(board.sunk_ships) / len(SHIPS)
+    state[166] = (len(SHIPS) - len(board.sunk_ships)) / len(SHIPS)
+    
+    # Turns taken so far
+    state[167] = len(board.shots) / MAX_SHOTS
+    
+    # Efficiency ratio (hits / shots)
+    state[168] = len(board.hits) / max(1, len(board.shots))
+    
+    # shots remaining ratio
+    state[169] = (MAX_SHOTS - len(board.shots)) / MAX_SHOTS
+    
+    return state
+
+class DRLAgent:
+    def __init__(self, state_size=170, action_size=100, batch_size=64):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.batch_size = batch_size
+        self.gamma = 0.99  # Discount factor
+        self.epsilon = 1.0  # Exploration rate
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9975  # Faster decay
+        self.learning_rate = 0.001  # Increased learning rate
+        
+        # Q-Networks
+        self.policy_net = DQN(state_size, action_size).to(device)
+        self.target_net = DQN(state_size, action_size).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+        self.memory = ReplayMemory(capacity=200000)  # Larger memory
+        
+        self.step_counter = 0
+        self.update_target_every = 200  # More frequent updates
+    
+    def act(self, state, valid_actions):
+        """Choose an action based on state"""
+        # Extract hits from state for pattern matching
+        hits = set()
+        for i in range(100):
+            row, col = i // 10, i % 10
+            if state[i] == 2:  # 2 indicates a hit
+                hits.add((row, col))
+        
+        # Get exploration decision
+        use_random = random.random() < self.epsilon
+        
+        # IMPROVED HUNT/TARGET: Higher probability of using pattern matching
+        # Even when using network, apply hunt/target strategy with higher probability
+        if hits and (len(hits) < 17):  # 17 is total ship cells
+            # Calculate adjacency scores for all valid actions
+            adjacent_scores = {}
+            for r, c in valid_actions:
+                score = 0
+                # Check adjacent cells to hits with higher weights
+                for hit_r, hit_c in hits:
+                    # Manhattan distance of 1 indicates adjacent cell
+                    if abs(hit_r - r) + abs(hit_c - c) == 1:
+                        score += 5  # Increased from 2 to 5
+                    # Check for line patterns (2 hits in a row)
+                    for dr, dc in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                        if (hit_r + dr, hit_c + dc) in hits:
+                            # Project the line in both directions
+                            if (r == hit_r + 2*dr and c == hit_c + 2*dc) or \
+                               (r == hit_r - dr and c == hit_c - dc):
+                                score += 10  # Increased from 5 to 10
+                
+                if score > 0:
+                    adjacent_scores[(r, c)] = score
+            
+            # If we found adjacent cells, use them more often (90% instead of 50%)
+            if adjacent_scores and (use_random or random.random() < 0.9):  # Change from 0.5 to 0.9
+                best_actions = [a for a, s in adjacent_scores.items() 
+                              if s == max(adjacent_scores.values())]
+                return random.choice(best_actions)
+        
+        # Standard exploration or exploitation
+        if use_random:
+            if not hits:  # No hits yet, use checkerboard pattern for better start
+                checkerboard = [(r,c) for r,c in valid_actions if (r+c)%2 == 0]
+                if checkerboard:
+                    return random.choice(checkerboard)
+            return random.choice(valid_actions)
+        
+        # Use the network for exploitation
+        # FIX: Add this line to define state_tensor
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        
+        self.policy_net.eval()
+        with torch.no_grad():
+            q_values = self.policy_net(state_tensor).squeeze()
+        self.policy_net.train()
+        
+        # Create a mask for valid actions
+        valid_mask = torch.zeros(self.action_size, device=device)
+        for r, c in valid_actions:
+            idx = r * GRID_SIZE + c
+            valid_mask[idx] = 1
+        
+        # Mask out invalid actions
+        masked_q_values = q_values - 1e9 * (1 - valid_mask)
+        
+        # Choose the action with the highest Q-value
+        action_idx = masked_q_values.argmax().item()
+        row = action_idx // GRID_SIZE
+        col = action_idx % GRID_SIZE
+        
+        return (row, col)
+    
+    def learn(self):
+        """Update the policy network using experiences from memory"""
+        if len(self.memory) < self.batch_size:
+            return 0  # Not enough samples
+        
+        # Sample a batch of experiences
+        experiences = self.memory.sample(self.batch_size)
+        batch = Experience(*zip(*experiences))
+        
+        # Convert to tensors
+        state_batch = torch.FloatTensor(batch.state).to(device)
+        action_batch = torch.LongTensor(
+            [(a[0] * GRID_SIZE + a[1]) for a in batch.action]
+        ).unsqueeze(1).to(device)
+        reward_batch = torch.FloatTensor(batch.reward).to(device)
+        next_state_batch = torch.FloatTensor(batch.next_state).to(device)
+        done_batch = torch.FloatTensor(batch.done).to(device)
+        
+        # Compute current Q-values
+        current_q = self.policy_net(state_batch).gather(1, action_batch)
+        
+        # Compute next Q-values using the target network
+        with torch.no_grad():
+            next_q = self.target_net(next_state_batch).max(1)[0]
+        
+        # Compute target Q-values
+        target_q = reward_batch + (1 - done_batch) * self.gamma * next_q
+        target_q = target_q.unsqueeze(1)
+        
+        # Compute loss and optimize
+        loss = F.mse_loss(current_q, target_q)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Clip gradients to avoid exploding gradients
+        for param in self.policy_net.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+        
+        # Update target network periodically
+        self.step_counter += 1
+        if self.step_counter % self.update_target_every == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        return loss.item()
+    
+    def update_epsilon(self):
+        """Decay epsilon over time"""
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+    
+    def save_model(self, path=MODEL_PATH):
+        """Save the trained model"""
+        torch.save({
+            'policy_model': self.policy_net.state_dict(),
+            'target_model': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'epsilon': self.epsilon
+        }, path)
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path=MODEL_PATH):
+        """Load a trained model"""
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=device)
+            self.policy_net.load_state_dict(checkpoint['policy_model'])
+            self.target_net.load_state_dict(checkpoint['target_model'])
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+            self.epsilon = checkpoint['epsilon']
+            print(f"Model loaded from {path}")
+            return True
+        return False
+
+def train_agent(num_episodes=10000, max_shots=MAX_SHOTS, plot_interval=100):
+    agent = DRLAgent()
+    board = Board()
+    
+    # For statistics
+    stats = {
+        'episode_rewards': [],
+        'episode_shots': [],
+        'win_rate': [],
+        'losses': [],
+        'rolling_avg_shots': []
+    }
+    wins = 0
+    total_shots = []
+    
+    # Try to load existing model if it exists
+    if agent.load_model():
+        print("Continuing training from saved model")
+    
+    # Training loop
+    start_time = time.time()
+    print("Starting training...")
+    
+    for episode in range(1, num_episodes + 1):
+        board.reset()  # Reset the board with new random ship placements
+        state = encode_simple_state(board)
+        episode_reward = 0
+        shots_taken = 0
+        episode_loss = 0
+        
+        if episode % 100 == 0:
+            print(f"\nDetailed stats for episode {episode}:")
+            print(f"  Current epsilon: {agent.epsilon:.4f}")
+            print(f"  Memory size: {len(agent.memory)}")
+            print(f"  100-game avg shots: {np.mean(stats['episode_shots'][-100:]):.2f}")
+        
+        while shots_taken < max_shots:
+            # Choose action
+            valid_actions = board.get_valid_actions()
+            action = agent.act(state, valid_actions)
+            
+            # Take action
+            result, reward, done = board.receive_shot(action[0], action[1])
+            shots_taken += 1
+            
+            # Add even stronger incentive for efficiency
+            if done:
+                # Stronger bonus for quick wins
+                reward += 25.0 + (max_shots - shots_taken) * 0.8
+            else:
+                # Progressive time penalty (gets worse as game goes on)
+                time_penalty = -0.05 * (1.0 + shots_taken / 20.0)
+                reward += time_penalty
+            
+            # Get next state
+            next_state = encode_simple_state(board)
+            
+            # Store experience
+            agent.memory.push(Experience(state, action, reward, next_state, done))
+            
+            # Learn from experience
+            loss = agent.learn()
+            if loss:
+                episode_loss += loss
+            
+            # Update state and reward
+            state = next_state
+            episode_reward += reward
+            
+            # If game over (either won or max shots reached)
+            if done:
+                wins += 1
+                break
+        
+        # Update epsilon
+        agent.update_epsilon()
+        
+        # Collect statistics
+        stats['episode_rewards'].append(episode_reward)
+        stats['episode_shots'].append(shots_taken)
+        stats['losses'].append(episode_loss / max(1, shots_taken))
+        total_shots.append(shots_taken)
+        
+        if episode % 100 == 0:
+            print(f"  Game {episode} - Shots: {shots_taken}, Hits: {len(board.hits)}, Misses: {len(board.misses)}")
+            print(f"  Sunk ships: {len(board.sunk_ships)}/{len(SHIPS)}")
+            print(f"  Efficiency: {len(board.hits)/max(1, shots_taken):.2f}")
+        
+        # Calculate win rate and average shots over last 100 episodes
+        if episode % plot_interval == 0:
+            recent_wins = stats['episode_shots'][-plot_interval:].count(max_shots)
+            win_rate = (plot_interval - recent_wins) / plot_interval
+            avg_shots = np.mean(stats['episode_shots'][-plot_interval:])
+            stats['win_rate'].append(win_rate)
+            stats['rolling_avg_shots'].append(avg_shots)
+            
+            elapsed_time = time.time() - start_time
+            print(f"Episode {episode}/{num_episodes} - "
+                  f"Win Rate: {win_rate:.2f}, "
+                  f"Avg Shots: {avg_shots:.2f}, "
+                  f"Epsilon: {agent.epsilon:.4f}, "
+                  f"Time: {elapsed_time:.1f}s")
+            
+            # Save the model every 1000 episodes
+            if episode % 1000 == 0:
+                agent.save_model()
+                
+                # Save training stats
+                with open(STATS_PATH, 'wb') as f:
+                    pickle.dump(stats, f)
+                
+                # Plot progress
+                plot_training_stats(stats, episode)
+    
+    # Final save
+    agent.save_model()
+    
+    # Save final stats
+    with open(STATS_PATH, 'wb') as f:
+        pickle.dump(stats, f)
+    
+    # Final stats
+    print("\n======= Training Complete =======")
+    print(f"Win rate: {wins/num_episodes:.4f}")
+    print(f"Average shots per game: {np.mean(total_shots):.2f}")
+    print(f"Total training time: {time.time() - start_time:.1f} seconds")
+    
+    # Plot final training curves
+    plot_training_stats(stats, num_episodes)
+    
+    return agent, stats
+
+def plot_training_stats(stats, episodes):
+    """Plot training statistics"""
+    plt.figure(figsize=(15, 12))
+    
+    # Plot average rewards
+    plt.subplot(2, 2, 1)
+    plt.plot(stats['episode_rewards'])
+    plt.title(f'Episode Rewards (after {episodes} episodes)')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    
+    # Plot rolling average of shots needed
+    plt.subplot(2, 2, 2)
+    window = min(100, len(stats['episode_shots']))
+    rolling_mean = [np.mean(stats['episode_shots'][max(0, i-window):i+1]) 
+                   for i in range(len(stats['episode_shots']))]
+    plt.plot(rolling_mean)
+    plt.title(f'Average Shots per Episode (window={window})')
+    plt.xlabel('Episode')
+    plt.ylabel('Shots')
+    
+    # Plot win rate
+    if stats['win_rate']:
+        plt.subplot(2, 2, 3)
+        plt.plot(range(100, episodes+1, 100), stats['win_rate'])
+        plt.title('Win Rate (per 100 episodes)')
+        plt.xlabel('Episode')
+        plt.ylabel('Win Rate')
+    
+    # Plot average loss
+    if stats['losses']:
+        plt.subplot(2, 2, 4)
+        window = min(100, len(stats['losses']))
+        rolling_loss = [np.mean(stats['losses'][max(0, i-window):i+1]) 
+                       for i in range(len(stats['losses']))]
+        plt.plot(rolling_loss)
+        plt.title(f'Average Loss (window={window})')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+    
+    plt.tight_layout()
+    plt.savefig('training_progress.png')
+    plt.close()
+
+def evaluate_agent(agent, num_games=100):
+    """Evaluate the trained agent's performance"""
+    board = Board()
+    
+    win_count = 0
+    total_shots = []
+    total_hits = []
+    ship_hits = {ship["name"]: [] for ship in SHIPS}
+    
+    print("\n======= Evaluating Agent =======")
+    
+    for game in range(num_games):
+        board.reset()
+        shots_taken = 0
+        hits = 0
+        
+        # Track each ship's hits separately
+        ship_hit_counts = {ship["name"]: 0 for ship in SHIPS}
+        
+        # Play until win or max shots reached
+        while shots_taken < MAX_SHOTS:
+            state = encode_simple_state(board)
+            valid_actions = board.get_valid_actions()
+            
+            # Agent chooses action (no exploration during evaluation)
+            old_epsilon = agent.epsilon
+            agent.epsilon = 0.0
+            action = agent.act(state, valid_actions)
+            agent.epsilon = old_epsilon
+            
+            # Take action
+            result, _, done = board.receive_shot(action[0], action[1])
+            shots_taken += 1
+            
+            if result == "hit" or result == "sunk":
+                hits += 1
+                
+                # Track which ship was hit/sunk
+                if result == "sunk":
+                    for ship in board.ships:
+                        if ship["sunk"] and ship_hit_counts[ship["name"]] < ship["hits"]:
+                            ship_hit_counts[ship["name"]] = ship["hits"]
+            
+            # Check if game won
+            if done:
+                win_count += 1
+                break
+        
+        # Collect statistics
+        total_shots.append(shots_taken)
+        total_hits.append(hits)
+        
+        # Record ship hit counts
+        for name, count in ship_hit_counts.items():
+            if count > 0:  # Only record if the ship was hit
+                ship_hits[name].append(count)
+        
+        # Progress update
+        if (game + 1) % 10 == 0:
+            print(f"Evaluated {game + 1}/{num_games} games - "
+                  f"Current win rate: {win_count/(game+1):.2f}")
+    
+    # Calculate statistics
+    win_rate = win_count / num_games
+    avg_shots = np.mean(total_shots)
+    avg_hits = np.mean(total_hits)
+    shot_efficiency = avg_hits / avg_shots if avg_shots > 0 else 0
+    
+    # Print results
+    print("\n======= Evaluation Results =======")
+    print(f"Win rate: {win_rate:.4f}")
+    print(f"Average shots per game: {avg_shots:.2f}")
+    print(f"Average hits per game: {avg_hits:.2f}")
+    print(f"Shot efficiency (hits/shots): {shot_efficiency:.4f}")
+    
+    # Print ship-specific stats
+    print("\nAverage hits to sink each ship:")
+    for name, hits_list in ship_hits.items():
+        if hits_list:
+            avg = np.mean(hits_list)
+            print(f"  {name}: {avg:.2f}")
+    
+    return {
+        'win_rate': win_rate,
+        'avg_shots': avg_shots,
+        'avg_hits': avg_hits,
+        'shot_efficiency': shot_efficiency,
+        'total_shots': total_shots,
+        'ship_hits': ship_hits
+    }
+
+def main():
+    # Timer for total execution
+    total_start_time = time.time()
+    
+    # Full training with 10,000 episodes as requested
+    training_episodes = 10000
+    
+    # Train the agent
+    print(f"Starting training for {training_episodes} episodes...")
+    agent, stats = train_agent(num_episodes=training_episodes)
+    
+    training_time = time.time() - total_start_time
+    hours, remainder = divmod(training_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Total training time: {int(hours)}h {int(minutes)}m {seconds:.1f}s")
+    
+    # Track evaluation time separately
+    eval_start_time = time.time()
+    print(f"Evaluating model over 200 games...")
+    eval_stats = evaluate_agent(agent, num_games=200)
+    
+    eval_time = time.time() - eval_start_time
+    print(f"Evaluation complete in {eval_time:.1f} seconds")
+    
+    # Create more detailed plots including average shots per win
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Shot distribution
+    plt.subplot(2, 2, 1)
+    plt.hist(eval_stats['total_shots'], bins=20, alpha=0.7)
+    plt.axvline(eval_stats['avg_shots'], color='r', linestyle='dashed', 
+               linewidth=2, label=f'Mean: {eval_stats["avg_shots"]:.2f}')
+    plt.title('Distribution of Shots per Game')
+    plt.xlabel('Number of Shots')
+    plt.ylabel('Frequency')
+    plt.legend()
+    
+    # Plot 2: Average hits by ship type
+    plt.subplot(2, 2, 2)
+    ship_names = []
+    avg_hits = []
+    for name, hits_list in eval_stats['ship_hits'].items():
+        if hits_list:
+            ship_names.append(name)
+            avg_hits.append(np.mean(hits_list))
+    
+    bars = plt.bar(ship_names, avg_hits)
+    plt.title('Average Hits to Sink Each Ship')
+    plt.ylabel('Avg. Hits')
+    plt.xticks(rotation=45)
+    
+    # Add labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                f'{height:.2f}', ha='center', va='bottom')
+    
+    # Plot 3: Shots per win over training history
+    plt.subplot(2, 2, 3)
+    win_indices = [i for i, shots in enumerate(stats['episode_shots']) 
+                 if shots < MAX_SHOTS]
+    win_shots = [stats['episode_shots'][i] for i in win_indices]
+    
+    if win_shots:
+        window = min(50, len(win_shots))
+        win_rolling_mean = [np.mean(win_shots[max(0, i-window):i+1]) 
+                           for i in range(len(win_shots))]
+        plt.plot(win_indices, win_rolling_mean)
+        plt.title(f'Avg Shots per Win (rolling window={window})')
+        plt.xlabel('Win Number')
+        plt.ylabel('Shots to Win')
+    
+    # Plot 4: Efficiency improvement - fix the undefined num_episodes
+    plt.subplot(2, 2, 4)
+    if 'rolling_avg_shots' in stats and stats['rolling_avg_shots']:
+        plt.plot(range(100, training_episodes+1, 100), stats['rolling_avg_shots'])
+        plt.title('Agent Efficiency Improvement')
+        plt.xlabel('Episode')
+        plt.ylabel('Avg Shots per Game')
+    
+    plt.tight_layout()
+    plt.savefig('detailed_evaluation.png')
+    plt.show()
+    
+    # Print a detailed performance summary
+    print("\n======= PERFORMANCE SUMMARY =======")
+    print(f"Final win rate: {eval_stats['win_rate']:.2%}")
+    print(f"Average shots to win: {eval_stats['avg_shots']:.2f}")
+    print(f"Shot efficiency: {eval_stats['shot_efficiency']:.2%}")
+    print("\nAverage shots to sink each ship:")
+    for name in ship_names:
+        idx = ship_names.index(name)
+        print(f"  {name}: {avg_hits[idx]:.2f}")
+
+if __name__ == "__main__":
+    main()
