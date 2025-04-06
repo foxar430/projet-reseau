@@ -1,0 +1,1361 @@
+import pygame
+import random
+import sys
+import time
+import os
+from lo3ba_ai import BattleshipAI
+
+# Initialize Pygame
+pygame.init()
+
+# Constants
+SCREEN_WIDTH = 1000
+SCREEN_HEIGHT = 700
+GRID_SIZE = 10
+CELL_SIZE = 40
+GRID_PADDING = 50
+FONT_SIZE = 24
+
+# Enhanced Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GRAY = (200, 200, 200)
+LIGHT_BLUE = (173, 216, 230)
+DEEP_BLUE = (0, 80, 125)
+BLUE = (0, 120, 215)
+RED = (255, 0, 0)
+GREEN = (0, 180, 0)
+YELLOW = (255, 215, 0)
+NAVY = (0, 0, 80)
+OCEAN = (65, 105, 225)
+LIGHT_GRAY = (220, 220, 220)
+ORANGE = (255, 165, 0)  # Used for sunk ship indicators
+SOFT_RED = (255, 100, 100)  # Softer red for sunk ships
+
+# Game State
+MENU = 0
+SETUP = 1
+GAMEPLAY = 2
+GAME_OVER = 3
+
+class Ship:
+    def __init__(self, size, name):
+        self.size = size
+        self.name = name
+        self.hits = 0
+        self.coordinates = []
+        self.sunk = False
+        self.horizontal = True
+        self.placed = False
+    
+    def hit(self):
+        self.hits += 1
+        if self.hits == self.size:
+            self.sunk = True
+            return True
+        return False
+
+    def draw(self, screen, x, y, cell_size, is_selected=False):
+        """Draw ship with enhanced appearance"""
+        padding = 2
+        width = self.size * cell_size - padding * 2 if self.horizontal else cell_size - padding * 2
+        height = cell_size - padding * 2 if self.horizontal else self.size * cell_size - padding * 2
+        
+        # Create ship rect
+        ship_rect = pygame.Rect(x + padding, y + padding, width, height)
+        
+        # Choose color and border based on selection state and sunk status
+        if self.sunk:
+            color = SOFT_RED
+            border_color = RED
+        else:
+            color = DEEP_BLUE if not is_selected else YELLOW
+            border_color = YELLOW if is_selected else BLUE
+        
+        # Draw ship body
+        pygame.draw.rect(screen, color, ship_rect)
+        pygame.draw.rect(screen, border_color, ship_rect, 2, border_radius=3)
+        
+        # Add details to the ship
+        if self.horizontal and self.size > 1:
+            # Draw segments for horizontal ship
+            for i in range(1, self.size):
+                segment_x = x + i * cell_size
+                pygame.draw.line(screen, border_color, 
+                                (segment_x, y + padding),
+                                (segment_x, y + height + padding - 1), 1)
+        elif not self.horizontal and self.size > 1:
+            # Draw segments for vertical ship
+            for i in range(1, self.size):
+                segment_y = y + i * cell_size
+                pygame.draw.line(screen, border_color, 
+                                (x + padding, segment_y),
+                                (x + width + padding - 1, segment_y), 1)
+
+class Explosion:
+    def __init__(self, x, y, is_hit=True):
+        self.x = x
+        self.y = y
+        self.is_hit = is_hit
+        self.frame = 0
+        self.max_frames = 8
+        self.timer = 0
+        self.frame_delay = 40  # milliseconds
+
+    def update(self, dt):
+        self.timer += dt
+        if self.timer >= self.frame_delay:
+            self.frame += 1
+            self.timer = 0
+        return self.frame < self.max_frames
+
+    def draw(self, screen):
+        if self.is_hit:
+            # Draw hit explosion (red expanding circle)
+            radius = (self.frame + 1) * 5
+            alpha = 255 - (self.frame * 30)
+            if alpha < 0:
+                alpha = 0
+                
+            # Create a surface with per-pixel alpha
+            surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 0, 0, alpha), (radius, radius), radius)
+            screen.blit(surf, (self.x - radius, self.y - radius))
+        else:
+            # Draw miss splash (blue expanding circle)
+            radius = (self.frame + 1) * 3
+            alpha = 200 - (self.frame * 25)
+            if alpha < 0:
+                alpha = 0
+                
+            # Create a surface with per-pixel alpha
+            surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 255, 255, alpha), (radius, radius), radius)
+            screen.blit(surf, (self.x - radius, self.y - radius))
+
+class Board:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.size = GRID_SIZE
+        self.grid = [['~' for _ in range(self.size)] for _ in range(self.size)]
+        self.ships = []
+        self.shots = set()
+        self.animations = []
+        self.hover_cell = None
+    
+    def place_ship(self, ship, row, col, horizontal):
+        # Reset ship's existing coordinates
+        ship.coordinates = []
+        
+        # Check if ship can be placed
+        if horizontal:
+            if col + ship.size > self.size:
+                return False
+            for i in range(ship.size):
+                if self.grid[row][col + i] != '~':
+                    return False
+            
+            # Place ship
+            for i in range(ship.size):
+                self.grid[row][col + i] = 'O'
+                ship.coordinates.append((row, col + i))
+        else:
+            if row + ship.size > self.size:
+                return False
+            for i in range(ship.size):
+                if self.grid[row + i][col] != '~':
+                    return False
+            
+            # Place ship
+            for i in range(ship.size):
+                self.grid[row + i][col] = 'O'
+                ship.coordinates.append((row + i, col))
+        
+        self.ships.append(ship)
+        ship.horizontal = horizontal
+        ship.placed = True
+        return True
+    
+    def place_ships_randomly(self, ships):
+        for ship in ships:
+            placed = False
+            while not placed:
+                row = random.randint(0, self.size - 1)
+                col = random.randint(0, self.size - 1)
+                horizontal = random.choice([True, False])
+                placed = self.place_ship(ship, row, col, horizontal)
+    
+    def receive_shot(self, row, col):
+        if (row, col) in self.shots:
+            return "already_shot"
+        
+        self.shots.add((row, col))
+        
+        # Add animation at the shot location
+        center_x = self.x + col * CELL_SIZE + CELL_SIZE // 2
+        center_y = self.y + row * CELL_SIZE + CELL_SIZE // 2
+        
+        if self.grid[row][col] == 'O':
+            self.grid[row][col] = 'X'
+            # Add hit animation
+            self.animations.append(Explosion(center_x, center_y, True))
+            
+            for ship in self.ships:
+                if (row, col) in ship.coordinates:
+                    sunk = ship.hit()
+                    if sunk:
+                        return f"sunk_{ship.name}"
+                    return "hit"
+        else:
+            self.grid[row][col] = 'M'
+            # Add miss animation
+            self.animations.append(Explosion(center_x, center_y, False))
+            return "miss"
+    
+    def all_ships_sunk(self):
+        return all(ship.sunk for ship in self.ships)
+    
+    def update(self, dt, mouse_pos=None):
+        # Update animations
+        self.animations = [anim for anim in self.animations if anim.update(dt)]
+        
+        # Update hover cell
+        if mouse_pos:
+            if (self.x <= mouse_pos[0] <= self.x + self.size * CELL_SIZE and
+                self.y <= mouse_pos[1] <= self.y + self.size * CELL_SIZE):
+                grid_x = (mouse_pos[0] - self.x) // CELL_SIZE
+                grid_y = (mouse_pos[1] - self.y) // CELL_SIZE
+                self.hover_cell = (grid_y, grid_x)
+            else:
+                self.hover_cell = None
+        else:
+            self.hover_cell = None
+    
+    def draw(self, screen, hide_ships=False, selected_ship=None, is_horizontal=True):
+        # Draw water background with subtle pattern
+        water_rect = pygame.Rect(self.x - 5, self.y - 5, 
+                               self.size * CELL_SIZE + 10, self.size * CELL_SIZE + 10)
+        pygame.draw.rect(screen, OCEAN, water_rect, border_radius=5)
+        
+        # Draw subtle wave lines
+        for i in range(0, self.size * CELL_SIZE, 10):
+            alpha = random.randint(20, 60)
+            wave_surf = pygame.Surface((self.size * CELL_SIZE, 3), pygame.SRCALPHA)
+            pygame.draw.line(wave_surf, (255, 255, 255, alpha), (0, 1), (self.size * CELL_SIZE, 1), 2)
+            screen.blit(wave_surf, (self.x, self.y + i))
+
+        # Draw grid
+        for row in range(self.size):
+            for col in range(self.size):
+                rect = pygame.Rect(
+                    self.x + col * CELL_SIZE, 
+                    self.y + row * CELL_SIZE,
+                    CELL_SIZE, CELL_SIZE
+                )
+                pygame.draw.rect(screen, LIGHT_BLUE, rect)
+                pygame.draw.rect(screen, GRAY, rect, 1)
+                
+                # Draw ships, hits and misses
+                if (row, col) in self.shots:
+                    if self.grid[row][col] == 'X':
+                        # Hit
+                        # Draw hit effect
+                        pygame.draw.circle(
+                            screen, RED,
+                            (self.x + col * CELL_SIZE + CELL_SIZE // 2,
+                             self.y + row * CELL_SIZE + CELL_SIZE // 2),
+                            CELL_SIZE // 3
+                        )
+                        
+                        # Draw X mark
+                        pygame.draw.line(
+                            screen, BLACK,
+                            (self.x + col * CELL_SIZE + 10, self.y + row * CELL_SIZE + 10),
+                            (self.x + col * CELL_SIZE + CELL_SIZE - 10, 
+                             self.y + row * CELL_SIZE + CELL_SIZE - 10), 2)
+                        pygame.draw.line(
+                            screen, BLACK,
+                            (self.x + col * CELL_SIZE + CELL_SIZE - 10, self.y + row * CELL_SIZE + 10),
+                            (self.x + col * CELL_SIZE + 10, 
+                             self.y + row * CELL_SIZE + CELL_SIZE - 10), 2)
+                    elif self.grid[row][col] == 'M':
+                        # Miss
+                        pygame.draw.circle(
+                            screen, WHITE,
+                            (self.x + col * CELL_SIZE + CELL_SIZE // 2,
+                             self.y + row * CELL_SIZE + CELL_SIZE // 2),
+                            CELL_SIZE // 4, 0
+                        )
+                        pygame.draw.circle(
+                            screen, BLACK,
+                            (self.x + col * CELL_SIZE + CELL_SIZE // 2,
+                             self.y + row * CELL_SIZE + CELL_SIZE // 2),
+                            CELL_SIZE // 4, 1
+                        )
+        
+        # Draw ships with special rendering for sunk ships
+        if not hide_ships:
+            for ship in self.ships:
+                # Find the top-left corner of the ship
+                if len(ship.coordinates) > 0:  # Only if ship is placed
+                    if ship.horizontal:
+                        start_row = ship.coordinates[0][0]
+                        start_col = min(c for r, c in ship.coordinates)
+                        ship.draw(screen, 
+                                self.x + start_col * CELL_SIZE, 
+                                self.y + start_row * CELL_SIZE, 
+                                CELL_SIZE)
+                    else:
+                        start_row = min(r for r, c in ship.coordinates)
+                        start_col = ship.coordinates[0][1]
+                        ship.draw(screen, 
+                                self.x + start_col * CELL_SIZE, 
+                                self.y + start_row * CELL_SIZE, 
+                                CELL_SIZE)
+        
+        # For gameplay, highlight sunk ships even on opponent's board
+        for ship in self.ships:
+            if ship.sunk:
+                # Add a special marker for sunk ships
+                for row, col in ship.coordinates:
+                    # Draw a distinctive marker to indicate a sunk ship part
+                    rect_center = (
+                        self.x + col * CELL_SIZE + CELL_SIZE // 2,
+                        self.y + row * CELL_SIZE + CELL_SIZE // 2
+                    )
+                    
+                    # Draw orange outline for sunk ship cells
+                    sunk_rect = pygame.Rect(
+                        self.x + col * CELL_SIZE + 2, 
+                        self.y + row * CELL_SIZE + 2,
+                        CELL_SIZE - 4, CELL_SIZE - 4
+                    )
+                    pygame.draw.rect(screen, ORANGE, sunk_rect, 2, border_radius=3)
+                    
+                    # Draw sunk indicator text "X"
+                    if not hide_ships:
+                        small_font = pygame.font.Font(None, 28)
+                        sunk_text = small_font.render("✓", True, ORANGE)
+                        text_rect = sunk_text.get_rect(center=rect_center)
+                        screen.blit(sunk_text, text_rect)
+        
+        # Draw hover effect for ship placement
+        if self.hover_cell and selected_ship:
+            row, col = self.hover_cell
+            # Check if ship can be placed
+            can_place = True
+            cells_to_highlight = []
+            
+            if is_horizontal:
+                if col + selected_ship.size <= self.size:
+                    for i in range(selected_ship.size):
+                        if col + i < self.size:
+                            cells_to_highlight.append((row, col + i))
+                            if self.grid[row][col + i] != '~':
+                                can_place = False
+                else:
+                    can_place = False
+            else:
+                if row + selected_ship.size <= self.size:
+                    for i in range(selected_ship.size):
+                        if row + i < self.size:
+                            cells_to_highlight.append((row + i, col))
+                            if self.grid[row + i][col] != '~':
+                                can_place = False
+                else:
+                    can_place = False
+            
+            # Draw placement preview
+            for cell_row, cell_col in cells_to_highlight:
+                rect = pygame.Rect(
+                    self.x + cell_col * CELL_SIZE, 
+                    self.y + cell_row * CELL_SIZE,
+                    CELL_SIZE, CELL_SIZE
+                )
+                placement_color = (0, 255, 0, 100) if can_place else (255, 0, 0, 100)
+                # Create transparent surface
+                s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+                s.fill(placement_color)
+                screen.blit(s, rect)
+        
+        # Draw row and column labels with better styling
+        font = pygame.font.Font(None, FONT_SIZE)
+        label_bg = (200, 200, 220, 180)
+        
+        for i in range(self.size):
+            # Draw row labels (1-10)
+            row_label = font.render(str(i+1), True, BLACK)
+            label_rect = pygame.Rect(self.x - 25, self.y + i * CELL_SIZE + CELL_SIZE // 3 - 5, 20, 20)
+            pygame.draw.rect(screen, label_bg, label_rect, border_radius=3)
+            screen.blit(row_label, (self.x - 22, self.y + i * CELL_SIZE + CELL_SIZE // 3 - 2))
+            
+            # Draw column labels (A-J)
+            col_label = font.render(chr(65 + i), True, BLACK)
+            label_rect = pygame.Rect(self.x + i * CELL_SIZE + CELL_SIZE // 3 - 5, self.y - 25, 20, 20)
+            pygame.draw.rect(screen, label_bg, label_rect, border_radius=3)
+            screen.blit(col_label, (self.x + i * CELL_SIZE + CELL_SIZE // 3 - 2, self.y - 22))
+        
+        # Draw animations
+        for anim in self.animations:
+            anim.draw(screen)
+        
+        # Draw board outline
+        board_rect = pygame.Rect(self.x - 5, self.y - 5, 
+                               self.size * CELL_SIZE + 10, self.size * CELL_SIZE + 10)
+        pygame.draw.rect(screen, NAVY, board_rect, 3, border_radius=5)
+
+class Button:
+    def __init__(self, x, y, width, height, text, color, hover_color, text_color=BLACK, action=None):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.text = text
+        self.color = color
+        self.hover_color = hover_color
+        self.text_color = text_color
+        self.action = action
+        self.is_hovered = False
+        
+    def update(self, mouse_pos):
+        self.is_hovered = self.rect.collidepoint(mouse_pos)
+    
+    def draw(self, screen, font):
+        # Draw button with a 3D effect
+        color = self.hover_color if self.is_hovered else self.color
+        
+        # Button body with rounded corners
+        pygame.draw.rect(screen, color, self.rect, 0, border_radius=8)
+        
+        # Bottom shadow for 3D effect (use dark gray instead of alpha)
+        shadow_rect = pygame.Rect(self.rect.x + 2, self.rect.y + 2, 
+                                self.rect.width, self.rect.height)
+        pygame.draw.rect(screen, (50, 50, 50), shadow_rect, 0, border_radius=8)
+        pygame.draw.rect(screen, color, self.rect, 0, border_radius=8)
+        
+        # Border
+        pygame.draw.rect(screen, BLACK, self.rect, 2, border_radius=8)
+        
+        # Button text with enhanced visibility
+        text_surf = font.render(self.text, True, self.text_color)
+        text_rect = text_surf.get_rect(center=self.rect.center)
+        screen.blit(text_surf, text_rect)
+    
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.is_hovered and self.action:
+                return self.action()
+        return False
+
+class ShipStatusDisplay:
+    def __init__(self, x, y, player_num):
+        self.x = x
+        self.y = y
+        self.player_num = player_num
+        self.width = 180
+        self.height = 200
+        self.padding = 10
+        
+    def draw(self, screen, font, ships, opponent=False):
+        # Draw background panel
+        panel_rect = pygame.Rect(self.x, self.y, self.width, self.height)
+        pygame.draw.rect(screen, LIGHT_GRAY, panel_rect, 0, border_radius=8)
+        pygame.draw.rect(screen, GRAY, panel_rect, 2, border_radius=8)
+        
+        # Draw title
+        title = f"Player {self.player_num}'s Ships"
+        if opponent:
+            title = f"Opponent's Ships"
+        
+        title_surf = font.render(title, True, BLACK)
+        screen.blit(title_surf, (self.x + self.padding, self.y + self.padding))
+        
+        # Draw horizontal line
+        pygame.draw.line(screen, GRAY, 
+                       (self.x + self.padding, self.y + self.padding + 25),
+                       (self.x + self.width - self.padding, self.y + self.padding + 25), 2)
+        
+        # Draw ship status
+        y_offset = self.y + self.padding + 35
+        for ship in ships:
+            # Draw ship name
+            ship_name = font.render(ship.name, True, BLACK)
+            screen.blit(ship_name, (self.x + self.padding, y_offset))
+            
+            # Draw ship status (sunk or active)
+            status_color = RED if ship.sunk else GREEN
+            status_text = "Sunk" if ship.sunk else "Active"
+            status_surf = font.render(status_text, True, status_color)
+            screen.blit(status_surf, (self.x + self.width - status_surf.get_width() - self.padding, y_offset))
+            
+            # Draw hit counter
+            hit_text = f"{ship.hits}/{ship.size}"
+            hit_surf = font.render(hit_text, True, BLACK)
+            screen.blit(hit_surf, (self.x + self.width // 2, y_offset))
+            
+            y_offset += 25
+
+class Game:
+    def __init__(self):
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("Naval Battle")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, FONT_SIZE)
+        self.big_font = pygame.font.Font(None, 48)
+        
+        self.state = MENU
+        self.current_player = 1
+        self.selected_ship = None
+        self.ship_horizontal = True
+        self.winner = None
+        self.message = ""
+        self.message_timer = 0
+        
+        # Create menu buttons
+        self.menu_buttons = [
+            Button(250, 250, 500, 50, "Player vs Player", LIGHT_BLUE, BLUE, BLACK, 
+                  lambda: self.start_pvp_game()),
+            Button(250, 300, 500, 50, "Player vs AI", LIGHT_BLUE, BLUE, BLACK, 
+                  lambda: self.start_ai_game()),
+            Button(250, 350, 500, 50, "Start with Random Ship Placement", LIGHT_BLUE, BLUE, BLACK, 
+                  lambda: self.start_random_game()),
+            Button(250, 400, 500, 50, "Online Multiplayer", LIGHT_BLUE, BLUE, BLACK, 
+                  lambda: self.start_online_game()),
+            Button(250, 650, 500, 50, "Quit", RED, (200, 0, 0), WHITE, 
+                  lambda: self.quit_game())
+        ]
+        
+        # Create gameplay buttons
+        self.gameplay_buttons = []
+        
+        # Initialize new game elements
+        self.reset_game()
+        
+        # Add ship status displays
+        self.status_display1 = ShipStatusDisplay(50, 480, 1)
+        self.status_display2 = ShipStatusDisplay(SCREEN_WIDTH - 230, 480, 2)
+        
+        # Track mouse position
+        self.mouse_pos = (0, 0)
+    
+    def start_pvp_game(self):
+        self.state = SETUP
+        self.setup_complete = [False, False]
+        self.message = "Player 1: Place your ships!"
+        self.message_timer = 3000
+        return True
+    
+    def start_ai_game(self):
+        """Start a game against the AI opponent"""
+        self.reset_game()
+        self.is_ai_game = True
+        self.ai_player = 2  # AI will be player 2
+        
+        # Initialize the AI with the trained model
+        model_path = "battleship_drl_model.pth"  # Use your best model here
+        if os.path.exists(model_path):
+            self.ai = BattleshipAI(model_path)
+            print(f"AI loaded from {model_path}")
+        else:
+            print(f"Warning: Model file {model_path} not found. Using default AI.")
+            self.ai = BattleshipAI()
+        
+        # Setup initial state - player 1 places ships first
+        self.state = SETUP
+        self.current_player = 1
+        self.message = "Place your ships against the AI opponent!"
+        self.message_timer = 3000
+        return True
+    
+    def start_random_game(self):
+        self.state = SETUP
+        self.board1.place_ships_randomly(self.ships1)
+        self.board2.place_ships_randomly(self.ships2)
+        self.setup_complete = [True, True]
+        self.state = GAMEPLAY
+        self.current_player = 1
+        self.message = "Game started! Player 1's turn"
+        self.message_timer = 3000
+        return True
+    
+    def start_online_game(self):
+        """Start an online multiplayer game"""
+        from simple_client import SimpleClient
+        
+        self.reset_game()
+        self.is_online = True
+        
+        # Connect to server
+        self.network = SimpleClient()
+        if not self.network.connect():
+            self.message = "Failed to connect to server!"
+            self.message_timer = 3000
+            self.is_online = False
+            return False
+        
+        # Start game setup
+        self.state = SETUP
+        self.current_player = 1
+        self.message = "Place your ships for online match!"
+        self.message_timer = 3000
+        return True
+    
+    def quit_game(self):
+        pygame.quit()
+        sys.exit()
+    
+    def reset_game(self):
+        # Create boards
+        self.board1 = Board(GRID_PADDING, GRID_PADDING)
+        self.board2 = Board(SCREEN_WIDTH // 2 + GRID_PADDING, GRID_PADDING)
+        
+        # Create ships for both players
+        self.ships1 = [
+            Ship(5, "Carrier"),
+            Ship(4, "Battleship"),
+            Ship(3, "Cruiser"),
+            Ship(3, "Submarine"),
+            Ship(2, "Destroyer")
+        ]
+        self.ships2 = [
+            Ship(5, "Carrier"),
+            Ship(4, "Battleship"),
+            Ship(3, "Cruiser"),
+            Ship(3, "Submarine"),
+            Ship(2, "Destroyer")
+        ]
+        
+        self.remaining_ships1 = self.ships1.copy()
+        self.remaining_ships2 = self.ships2.copy()
+        self.selected_ship = None
+        self.ship_horizontal = True
+        self.current_player = 1
+        self.winner = None
+        self.setup_complete = [False, False]
+        
+        # Setup buttons
+        self.setup_buttons = [
+            Button(825, 350, 100, 50, "Rotate", GREEN, (0, 220, 0), BLACK, 
+                  lambda: self.rotate_ship()),
+            Button(825, 450, 100, 50, "Random", YELLOW, (220, 220, 0), BLACK, 
+                  lambda: self.random_placement())
+        ]
+        
+        # Game over buttons
+        self.gameover_buttons = [
+            Button(400, 400, 200, 50, "New Game", GREEN, (0, 220, 0), BLACK, 
+                  lambda: self.new_game())
+        ]
+        
+        # Add at the end of reset_game method
+        self.is_ai_game = False
+        self.ai = None
+        self.ai_player = None
+        self.ai_thinking = False
+        self.ai_move_timer = 0
+        self.ai_auto_place = True  # Flag to ensure AI places ships automatically
+        
+        # Add these online-related properties
+        self.is_online = False
+        self.network = None
+        self.player_id = None
+    
+    def rotate_ship(self):
+        if self.selected_ship:
+            self.ship_horizontal = not self.ship_horizontal
+            self.message = f"Rotated ship to {'horizontal' if self.ship_horizontal else 'vertical'}"
+            self.message_timer = 1000
+        return True
+    
+    def random_placement(self):
+        if self.current_player == 1:
+            board = self.board1
+            remaining_ships = self.remaining_ships1
+        else:
+            board = self.board2
+            remaining_ships = self.remaining_ships2
+            
+        board.place_ships_randomly(remaining_ships)
+        remaining_ships.clear()
+        self.selected_ship = None
+        self.setup_complete[self.current_player - 1] = True
+        
+        if self.current_player == 1:
+            self.current_player = 2
+            self.message = "Player 2: Place your ships!"
+            self.message_timer = 3000
+        else:
+            self.state = GAMEPLAY
+            self.current_player = 1
+            self.message = "Game started! Player 1's turn"
+            self.message_timer = 3000
+        return True
+    
+    def new_game(self):
+        self.reset_game()
+        self.state = MENU
+        return True
+    
+    def handle_setup_click(self, pos):
+        # Check if any setup buttons were clicked
+        for button in self.setup_buttons:
+            if button.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, 
+                                                   {'pos': pos, 'button': 1})):
+                return
+        
+        # Determine which board was clicked
+        if self.current_player == 1:
+            board = self.board1
+            remaining_ships = self.remaining_ships1
+        else:
+            board = self.board2
+            remaining_ships = self.remaining_ships2
+        
+        # Check if the click is within the board
+        if (board.x <= pos[0] <= board.x + board.size * CELL_SIZE and
+            board.y <= pos[1] <= board.y + board.size * CELL_SIZE):
+            
+            # Calculate grid position
+            grid_x = (pos[0] - board.x) // CELL_SIZE
+            grid_y = (pos[1] - board.y) // CELL_SIZE
+            
+            # Try to place selected ship
+            if self.selected_ship:
+                if board.place_ship(self.selected_ship, grid_y, grid_x, self.ship_horizontal):
+                    remaining_ships.remove(self.selected_ship)
+                    self.selected_ship = None
+                    
+                    # Check if all ships are placed
+                    if not remaining_ships:
+                        self.setup_complete[self.current_player - 1] = True
+                        
+                        # For online games, send ship placement to server
+                        if self.is_online:
+                            # Tell server we've placed ships
+                            print("Sending ship placement to server")
+                            self.network.send_message("SHIPS|")
+                            
+                            # Don't change state yet - wait for server to tell us
+                            self.message = "Waiting for server confirmation..."
+                            self.message_timer = 3000
+                            return
+                        
+                        # The rest of your existing code for non-online games
+                        if self.current_player == 1:
+                            if self.is_ai_game:
+                                print("Auto-placing AI ships...")  # Debug message
+                                # AI setup - automatically place ships randomly
+                                self.board2.place_ships_randomly(self.ships2)
+                                self.setup_complete[1] = True
+                                self.state = GAMEPLAY
+                                self.current_player = 1
+                                self.message = "Game started! Your turn"
+                                self.message_timer = 3000
+                                return  # Add this return to prevent any further processing
+                            else:
+                                # Regular PvP setup
+                                self.current_player = 2
+                                self.message = "Player 2: Place your ships!"
+                                self.message_timer = 3000
+                        else:
+                            self.state = GAMEPLAY
+                            self.current_player = 1
+                            self.message = "Game started! Player 1's turn"
+                            self.message_timer = 3000
+                else:
+                    self.message = "Cannot place ship here!"
+                    self.message_timer = 2000
+        
+        # Check if ship selection buttons were clicked
+        if self.current_player == 1:
+            if 800 <= pos[0] <= 950:
+                for i, ship in enumerate(remaining_ships):
+                    if 150 + i * 50 <= pos[1] <= 190 + i * 50:
+                        self.selected_ship = ship
+                        self.message = f"Selected {ship.name} (size {ship.size})"
+                        self.message_timer = 2000
+        else:
+            if 50 <= pos[0] <= 200:
+                for i, ship in enumerate(remaining_ships):
+                    if 150 + i * 50 <= pos[1] <= 190 + i * 50:
+                        self.selected_ship = ship
+                        self.message = f"Selected {ship.name} (size {ship.size})"
+                        self.message_timer = 2000
+    
+    def handle_gameplay_click(self, pos):
+        # Determine which board to target
+        if self.current_player == 1:
+            # Player 1 targets board 2
+            target_board = self.board2
+            grid_x = (pos[0] - self.board2.x) // CELL_SIZE
+            grid_y = (pos[1] - self.board2.y) // CELL_SIZE
+        else:
+            # Player 2 targets board 1
+            target_board = self.board1
+            grid_x = (pos[0] - self.board1.x) // CELL_SIZE
+            grid_y = (pos[1] - self.board1.y) // CELL_SIZE
+        
+        # Check if click is on the grid
+        if 0 <= grid_x < GRID_SIZE and 0 <= grid_y < GRID_SIZE:
+            # For online games, send shot to server
+            if self.is_online:
+                # Only allow if it's our turn
+                if self.current_player != self.player_id + 1:
+                    self.message = "Not your turn!"
+                    self.message_timer = 2000
+                    return
+                    
+                # Send shot to server
+                self.network.fire_shot(grid_y, grid_x)
+                self.message = "Shot sent to server..."
+                self.message_timer = 1000
+                return
+                
+            # Regular local game shot processing
+            result = target_board.receive_shot(grid_y, grid_x)
+            
+            if result == "already_shot":
+                self.message = "You already shot there!"
+                self.message_timer = 2000
+            else:
+                if result == "hit":
+                    self.message = "Hit!"
+                    self.message_timer = 2000
+                elif result == "miss":
+                    self.message = "Miss!"
+                    self.message_timer = 2000
+                    # Switch players
+                    self.current_player = 3 - self.current_player  # Toggle between 1 and 2
+                elif result.startswith("sunk"):
+                    ship_name = result.split("_")[1]
+                    self.message = f"You sunk the {ship_name}!"
+                    self.message_timer = 3000
+                
+                # Check for win condition
+                if target_board.all_ships_sunk():
+                    self.winner = self.current_player
+                    self.state = GAME_OVER
+    
+    def handle_game_over_click(self, pos):
+        for button in self.gameover_buttons:
+            if button.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, 
+                                                  {'pos': pos, 'button': 1})):
+                return
+    
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            
+            elif event.type == pygame.MOUSEMOTION:
+                self.mouse_pos = event.pos
+                # Update button hover states
+                if self.state == MENU:
+                    for button in self.menu_buttons:
+                        button.update(event.pos)
+                elif self.state == SETUP:
+                    for button in self.setup_buttons:
+                        button.update(event.pos)
+                elif self.state == GAME_OVER:
+                    for button in self.gameover_buttons:
+                        button.update(event.pos)
+            
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # Left mouse button
+                    if self.state == MENU:
+                        for button in self.menu_buttons:
+                            if button.handle_event(event):
+                                break
+                    elif self.state == SETUP:
+                        self.handle_setup_click(event.pos)
+                    elif self.state == GAMEPLAY:
+                        self.handle_gameplay_click(event.pos)
+                    elif self.state == GAME_OVER:
+                        self.handle_game_over_click(event.pos)
+            
+            elif event.type == pygame.KEYDOWN:
+                # Add keyboard shortcut for rotation (R key)
+                if event.key == pygame.K_r and self.state == SETUP and self.selected_ship:
+                    self.rotate_ship()
+    
+    def draw_menu(self):
+        # Create lighter gradient background
+        self.screen.fill(WHITE)
+        for y in range(SCREEN_HEIGHT):
+            color = (
+                int(200 + (55 * y / SCREEN_HEIGHT)),  # Lighter red
+                int(220 + (35 * y / SCREEN_HEIGHT)),  # Lighter green
+                int(240 + (15 * y / SCREEN_HEIGHT))   # Lighter blue
+            )
+            pygame.draw.line(self.screen, color, (0, y), (SCREEN_WIDTH, y))
+        
+        # Draw title with shadow effect
+        title_shadow = self.big_font.render("NAVAL BATTLE", True, BLACK)
+        title = self.big_font.render("NAVAL BATTLE", True, BLUE)
+        self.screen.blit(title_shadow, (SCREEN_WIDTH // 2 - title.get_width() // 2 + 2, 102))
+        self.screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 100))
+        
+        # Draw subtitle
+        subtitle = self.font.render("Battleship Strategy Game", True, NAVY)
+        self.screen.blit(subtitle, (SCREEN_WIDTH // 2 - subtitle.get_width() // 2, 160))
+        
+        # Draw buttons with better visibility
+        for button in self.menu_buttons:
+            button.draw(self.screen, self.font)
+        
+        # Draw decorative ships
+        ship1 = Ship(4, "Battleship")
+        ship1.draw(self.screen, 100, 300, 40, False)
+        
+        ship2 = Ship(3, "Cruiser")
+        ship2.horizontal = False
+        ship2.draw(self.screen, 850, 350, 40, False)
+    
+    def draw_setup(self):
+        # Create gradient background
+        for y in range(SCREEN_HEIGHT):
+            color = (220, 230, 240, 255)
+            pygame.draw.rect(self.screen, color, (0, y, SCREEN_WIDTH, 1))
+        
+        # Draw setup title with shadow
+        if self.current_player == 1:
+            title = f"Player 1: Place Your Ships"
+            board = self.board1
+            remaining_ships = self.remaining_ships1
+            sidebar_x = 800  # Right side for Player 1
+        else:
+            title = f"Player 2: Place Your Ships"
+            board = self.board2
+            remaining_ships = self.remaining_ships2
+            sidebar_x = 50  # Left side for Player 2
+        
+        title_shadow = self.font.render(title, True, BLACK)
+        title_text = self.font.render(title, True, BLUE)
+        self.screen.blit(title_shadow, (SCREEN_WIDTH // 2 - title_text.get_width() // 2 + 1, 11))
+        self.screen.blit(title_text, (SCREEN_WIDTH // 2 - title_text.get_width() // 2, 10))
+        
+        # Update and draw the active player's board for setup
+        mouse_pos = pygame.mouse.get_pos()
+        board.update(self.clock.get_time(), mouse_pos)
+        board.draw(self.screen, hide_ships=False, selected_ship=self.selected_ship, 
+                 is_horizontal=self.ship_horizontal)
+        
+        # Draw ship selection sidebar at the correct position
+        pygame.draw.rect(self.screen, LIGHT_BLUE, (sidebar_x, 100, 150, 400), 0, border_radius=8)
+        pygame.draw.rect(self.screen, NAVY, (sidebar_x, 100, 150, 400), 2, border_radius=8)
+        ship_select_text = self.font.render("Select Ship:", True, BLACK)
+        self.screen.blit(ship_select_text, (sidebar_x + 25, 110))
+        
+        # Draw available ships at the correct position
+        for i, ship in enumerate(remaining_ships):
+            is_selected = self.selected_ship == ship
+            ship.draw(self.screen, sidebar_x + 25, 150 + i * 50, 20, is_selected)
+            ship_name = self.font.render(ship.name, True, BLACK)
+            self.screen.blit(ship_name, (sidebar_x + 25 + ship.size * 20 + 10, 160 + i * 50))
+        
+        # Also adjust buttons and text based on sidebar position
+        if self.current_player == 1:
+            button_x = 825
+        else:
+            button_x = 75
+        
+        # Update button positions
+        self.setup_buttons[0].rect.x = button_x  # Rotate button
+        self.setup_buttons[1].rect.x = button_x  # Random button
+        
+        # Draw setup buttons (rotate & random)
+        for button in self.setup_buttons:
+            button.draw(self.screen, self.font)
+        
+        # Show rotation indicator
+        orientation = "Horizontal" if self.ship_horizontal else "Vertical"
+        orient_text = self.font.render(f"Orientation: {orientation}", True, BLACK)
+        orient_rect = pygame.Rect(sidebar_x, 410, 150, 30)
+        pygame.draw.rect(self.screen, LIGHT_GRAY, orient_rect, 0, border_radius=5)
+        self.screen.blit(orient_text, (sidebar_x + 25, 415))
+        
+        # Show keyboard shortcut hint
+        if self.selected_ship:
+            hint_text = self.font.render("Press 'R' to rotate", True, (50, 50, 50))
+            self.screen.blit(hint_text, (sidebar_x + 20, 520))
+    
+    def draw_gameplay(self):
+        # Fill with gradient background
+        self.screen.fill(WHITE)
+        for y in range(SCREEN_HEIGHT):
+            color = (240, 248, 255)
+            pygame.draw.rect(self.screen, color, (0, y, SCREEN_WIDTH, 1))
+        
+        # Draw player labels with shadow effect
+        player1_text = self.font.render("Your Board" if self.is_ai_game else "Player 1's Board", True, BLUE)
+        player2_text = self.font.render("AI's Board" if self.is_ai_game else "Player 2's Board", True, BLUE)
+        
+        # Draw label backgrounds
+        label1_rect = pygame.Rect(GRID_PADDING + 20, 5, player1_text.get_width() + 60, 30)
+        label2_rect = pygame.Rect(SCREEN_WIDTH // 2 + GRID_PADDING + 20, 5, 
+                               player2_text.get_width() + 60, 30)
+        
+        pygame.draw.rect(self.screen, LIGHT_BLUE, label1_rect, 0, border_radius=5)
+        pygame.draw.rect(self.screen, LIGHT_BLUE, label2_rect, 0, border_radius=5)
+        
+        # Draw active player indicator
+        if self.current_player == 1:
+            pygame.draw.rect(self.screen, GREEN, label1_rect, 3, border_radius=5)
+            pygame.draw.rect(self.screen, GRAY, label2_rect, 1, border_radius=5)
+        else:
+            pygame.draw.rect(self.screen, GRAY, label1_rect, 1, border_radius=5)
+            pygame.draw.rect(self.screen, GREEN, label2_rect, 3, border_radius=5)
+        
+        self.screen.blit(player1_text, (GRID_PADDING + 50, 10))
+        self.screen.blit(player2_text, (SCREEN_WIDTH // 2 + GRID_PADDING + 50, 10))
+        
+        # Draw current player indicator
+        current_text = None
+        if self.is_ai_game:
+            if self.current_player == 1:
+                current_text = self.big_font.render("Your Turn", True, RED)
+            else:
+                current_text = self.big_font.render("AI's Turn", True, RED)
+        else:
+            current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
+        mouse_pos = pygame.mouse.get_pos()
+        if self.current_player == 1:
+            # When player 1's turn, update hover on player 2's board
+            self.board1.update(self.clock.get_time())
+            self.board2.update(self.clock.get_time(), mouse_pos)
+        else:
+            # When player 2's turn, update hover on player 1's board
+            self.board1.update(self.clock.get_time(), mouse_pos)
+            self.board2.update(self.clock.get_time())
+            
+        # Draw boards
+        if self.is_ai_game:
+            # In AI games, player should always see their ships but never the AI's ships
+            self.board1.draw(self.screen, hide_ships=False)  # Player's board - always show ships
+            self.board2.draw(self.screen, hide_ships=True)   # AI's board - always hide ships
+        else:
+            # Regular PvP game - hide ships based on current player
+            self.board1.draw(self.screen, hide_ships=self.current_player == 2)
+            self.board2.draw(self.screen, hide_ships=self.current_player == 1)
+        
+        # Draw ship status displays
+        self.status_display1.draw(self.screen, self.font, self.ships1, opponent=self.current_player == 2)
+        self.status_display2.draw(self.screen, self.font, self.ships2, opponent=self.current_player == 1)
+        
+        # Draw message
+        if self.message and self.message_timer > 0:
+            msg_text = self.font.render(self.message, True, BLACK)
+            msg_bg = pygame.Rect(SCREEN_WIDTH // 2 - msg_text.get_width() // 2 - 10, 650,
+                              msg_text.get_width() + 20, 30)
+            pygame.draw.rect(self.screen, (255, 255, 200), msg_bg, 0, border_radius=5)
+            pygame.draw.rect(self.screen, BLACK, msg_bg, 1, border_radius=5)
+            self.screen.blit(msg_text, (SCREEN_WIDTH // 2 - msg_text.get_width() // 2, 655))
+        
+        self.screen.blit(current_text, (SCREEN_WIDTH // 2 - current_text.get_width() // 2, 600))
+    
+    def draw_game_over(self):
+        # Create gradient background
+        for y in range(SCREEN_HEIGHT):
+            r = int(150 + (100 * (1 - y / SCREEN_HEIGHT)))
+            g = int(150 + (100 * (1 - y / SCREEN_HEIGHT)))
+            b = int(200 + (55 * (1 - y / SCREEN_HEIGHT)))
+            pygame.draw.rect(self.screen, (r, g, b), (0, y, SCREEN_WIDTH, 1))
+        
+        # Draw confetti particles
+        for _ in range(10):
+            x = random.randint(0, SCREEN_WIDTH)
+            y = random.randint(0, SCREEN_HEIGHT)
+            size = random.randint(3, 10)
+            color = random.choice([RED, GREEN, BLUE, YELLOW])
+            pygame.draw.rect(self.screen, color, (x, y, size, size))
+        
+        # Draw game over message with shadow effect
+        game_over_shadow = self.big_font.render("GAME OVER", True, BLACK)
+        game_over_text = self.big_font.render("GAME OVER", True, RED)
+        
+        # Update winner text in draw_game_over
+        if self.is_ai_game and self.winner == self.ai_player:
+            winner_text = self.big_font.render("AI Wins!", True, BLUE)
+            winner_shadow = self.big_font.render("AI Wins!", True, BLACK)
+        elif self.is_ai_game:
+            winner_text = self.big_font.render("You Win!", True, BLUE)
+            winner_shadow = self.big_font.render("You Win!", True, BLACK)
+        else:
+            winner_text = self.big_font.render(f"Player {self.winner} Wins!", True, BLUE)
+            winner_shadow = self.big_font.render(f"Player {self.winner} Wins!", True, BLACK)
+        
+        # Draw shadow text slightly offset
+        self.screen.blit(game_over_shadow, (SCREEN_WIDTH // 2 - game_over_text.get_width() // 2 + 2, 202))
+        self.screen.blit(winner_shadow, (SCREEN_WIDTH // 2 - winner_text.get_width() // 2 + 2, 302))
+        
+        # Draw main text
+        self.screen.blit(game_over_text, (SCREEN_WIDTH // 2 - game_over_text.get_width() // 2, 200))
+        self.screen.blit(winner_text, (SCREEN_WIDTH // 2 - winner_text.get_width() // 2, 300))
+        
+        # Draw buttons
+        for button in self.gameover_buttons:
+            button.draw(self.screen, self.font)
+    
+    def update(self):
+        # Add this safety check first
+        if self.state == SETUP and self.current_player == 2 and self.is_ai_game:
+            # Force AI to place ships randomly
+            print("Safety trigger: Auto-placing AI ships...")
+            self.board2.place_ships_randomly(self.ships2)
+            self.setup_complete[1] = True
+            self.state = GAMEPLAY
+            self.current_player = 1
+            self.message = "Game started! Your turn"
+            self.message_timer = 3000
+
+        # Update message timer
+        if self.message_timer > 0:
+            self.message_timer -= self.clock.get_time()
+            if self.message_timer <= 0:
+                self.message = ""
+        
+        # Update boards
+        dt = self.clock.get_time()
+        mouse_pos = pygame.mouse.get_pos()
+        
+        # In setup phase, only update the active player's board
+        if self.state == SETUP:
+            if self.current_player == 1:
+                self.board1.update(dt, mouse_pos)
+                self.board2.update(dt)
+            else:
+                self.board1.update(dt)
+                self.board2.update(dt, mouse_pos)
+        
+        # Add this at the beginning of the update method after message timer code
+        # Around line 730-750
+        if self.state == GAMEPLAY and self.is_ai_game and self.current_player == self.ai_player:
+            # Add a delay to make the AI's move feel more natural
+            self.ai_move_timer += self.clock.get_time()
+            if self.ai_move_timer >= 800:  # 800ms delay
+                self.ai_move_timer = 0
+                self.make_ai_move()
+        
+        # Add this at the end of the method
+        # Handle online game network messages
+        if self.is_online and hasattr(self, 'network') and self.network.is_connected():
+            message = self.network.get_message()
+            if message:
+                self.handle_network_message(message)
+        
+        # Add to your update method
+        if self.is_online and hasattr(self, 'network') and self.network.is_connected():
+            message = self.network.get_message()
+            if message:
+                parts = message.split('|')
+                cmd = parts[0]
+                
+                if cmd == "PLAYER":
+                    self.player_id = int(parts[1])
+                    print(f"You are Player {self.player_id+1}")
+                
+                elif cmd == "START":
+                    self.message = "Game started! Place your ships."
+                    self.message_timer = 3000
+                
+                elif cmd == "READY":
+                    self.state = GAMEPLAY
+                    first_player = int(parts[1])
+                    self.current_player = first_player
+                    self.message = "Game started! " + ("Your turn" if first_player == self.player_id else "Opponent's turn")
+                    self.message_timer = 3000
+                
+                elif cmd == "SHOT":
+                    shooter = int(parts[1])
+                    row, col = int(parts[2]), int(parts[3])
+                    result = parts[4]
+                    
+                    # Update game state
+                    if shooter == self.player_id:
+                        # Your shot
+                        self.board2.grid[row][col] = 'X' if result == "HIT" else 'M'
+                        self.message = f"{result}!"
+                    else:
+                        # Opponent's shot
+                        self.board1.grid[row][col] = 'X' if result == "HIT" else 'M'
+                        self.message = f"Opponent's shot: {result}!"
+                    
+                    self.message_timer = 2000
+                    self.current_player = 1 if shooter == 0 else 0
+                
+                elif cmd == "QUIT":
+                    quitter = int(parts[1])
+                    self.message = "Opponent disconnected!"
+                    self.message_timer = 3000
+                    self.state = MENU
+                    self.is_online = False
+    
+    def make_ai_move(self):
+        """Execute the AI's turn"""
+        # Create board adapter for the AI
+        board_adapter = self.create_board_adapter(self.board1)
+        
+        # Get AI's choice of shot
+        row, col = self.ai.choose_shot(board_adapter)
+        
+        # Process the shot
+        result = self.board1.receive_shot(row, col)
+        
+        # Update message based on result
+        if result == "already_shot":
+            # This shouldn't happen with a properly trained AI
+            print("AI tried to shoot at an already targeted position!")
+            # Try again
+            self.make_ai_move()
+            return
+        elif result == "hit":
+            self.message = "AI hit your ship!"
+            self.message_timer = 2000
+        elif result == "miss":
+            self.message = "AI missed!"
+            self.message_timer = 2000
+            # Switch back to player's turn
+            self.current_player = 1
+        elif result.startswith("sunk"):
+            ship_name = result.split("_")[1]
+            self.message = f"AI sunk your {ship_name}!"
+            self.message_timer = 3000
+        
+        # Check for win condition
+        if self.board1.all_ships_sunk():
+            self.winner = self.ai_player
+            self.state = GAME_OVER
+    
+    def create_board_adapter(self, game_board):
+        """Create an adapter that converts the game board to AI format"""
+        class BoardAdapter:
+            def __init__(self, game_board):
+                self.size = 10
+                self.grid = game_board.grid
+                self.ships = game_board.ships
+                self.shots = set()
+                self.hits = set()
+                self.misses = set()
+                self.sunk_ships = []
+                
+                # Extract data from the game board
+                for r in range(self.size):
+                    for c in range(self.size):
+                        if (r, c) in game_board.shots:
+                            self.shots.add((r, c))
+                            if game_board.grid[r][c] == 'X':
+                                self.hits.add((r, c))
+                            elif game_board.grid[r][c] == 'M':
+                                self.misses.add((r, c))
+                
+                # Add sunk ships info
+                self.sunk_ships = [ship for ship in game_board.ships if ship.sunk]
+                
+            def get_valid_actions(self):
+                """Get all valid positions to shoot at"""
+                valid = []
+                for r in range(self.size):
+                    for c in range(self.size):
+                        if (r, c) not in self.shots:
+                            valid.append((r, c))
+                return valid
+        
+        return BoardAdapter(game_board)
+    
+    def handle_network_message(self, message):
+        """Process messages from the server"""
+        print(f"Processing network message: {message}")
+        
+        # Parse the string message format
+        parts = message.split('|')
+        message_type = parts[0]
+        
+        if message_type == "PING":
+            # Respond to keep-alive pings
+            self.network.send_message("PONG|")
+            return
+        
+        if message_type == "PLAYER":
+            self.player_id = int(parts[1])
+            print(f"You are Player {self.player_id + 1}")
+        
+        elif message_type == "START":
+            self.message = "Game started! Place your ships."
+            self.message_timer = 3000
+        
+        elif message_type == "WAIT":
+            self.message = "Waiting for other player to place ships..."
+            self.message_timer = 3000
+        
+        elif message_type == "YOURPLACEMENT":
+            self.message = "Your turn to place ships!"
+            self.message_timer = 3000
+        
+        elif message_type == "GAMESTART":
+            if len(parts) > 1:
+                first_player = int(parts[1])
+                self.state = GAMEPLAY
+                self.current_player = first_player + 1  # Convert to 1-based player number
+                self.message = "Game started! " + ("Your turn" if first_player == self.player_id else "Opponent's turn")
+                self.message_timer = 3000
+                print(f"Game starting with player {first_player+1} going first")
+        
+        elif message_type == "SHOT":
+            if len(parts) >= 5:
+                shooter = int(parts[1])
+                row, col = int(parts[2]), int(parts[3])
+                result = parts[4]
+                
+                # Update the appropriate board
+                if shooter == self.player_id:
+                    # Your shot at opponent's board
+                    if result == "HIT":
+                        self.board2.grid[row][col] = 'X'
+                    else:
+                        self.board2.grid[row][col] = 'M'
+                    self.message = f"{result}!"
+                else:
+                    # Opponent's shot at your board
+                    if result == "HIT":
+                        self.board1.grid[row][col] = 'X'
+                    else:
+                        self.board1.grid[row][col] = 'M'
+                    self.message = f"Opponent's shot: {result}!"
+                
+                self.message_timer = 2000
+                
+                # Update turn (convert from 0-based to 1-based)
+                self.current_player = (1 if shooter == 0 else 0) + 1
+                
+                # Add a message to indicate whose turn it is now
+                if self.current_player == self.player_id + 1:
+                    self.message += " Your turn now."
+                else:
+                    self.message += " Opponent's turn now."
+        
+        elif message_type == "QUIT":
+            self.message = "Opponent disconnected!"
+            self.message_timer = 3000
+            self.state = MENU
+            self.is_online = False
+    
+    def run(self):
+        while True:
+            self.handle_events()
+            self.update()
+            
+            # Drawing
+            if self.state == MENU:
+                self.draw_menu()
+            elif self.state == SETUP:
+                self.draw_setup()
+            elif self.state == GAMEPLAY:
+                self.draw_gameplay()
+            elif self.state == GAME_OVER:
+                self.draw_game_over()
+            
+            pygame.display.flip()
+            self.clock.tick(60)
+
+if __name__ == "__main__":
+    game = Game()
+    game.run()
