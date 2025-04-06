@@ -1,0 +1,95 @@
+import socket
+import threading
+import time
+
+class SimpleClient:
+    def __init__(self, host='localhost', port=5555):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.player_id = None
+        self.connected = False
+        self.messages = []
+        self.running = True
+    
+    def connect(self):
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.host, self.port))
+            self.connected = True
+            print(f"Connected to server at {self.host}:{self.port}")
+            
+            # Start thread to receive messages
+            thread = threading.Thread(target=self.receive_messages)
+            thread.daemon = True
+            thread.start()
+            
+            return True
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            return False
+    
+    def disconnect(self):
+        self.running = False
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+        self.connected = False
+    
+    def receive_messages(self):
+        try:
+            while self.running and self.connected:
+                try:
+                    data = self.socket.recv(1024).decode()
+                    if not data:
+                        self.connected = False
+                        break
+                    
+                    print(f"Received: {data}")
+                    parts = data.split('|')
+                    cmd = parts[0]
+                    
+                    if cmd == "PLAYER":
+                        self.player_id = int(parts[1])
+                        print(f"You are Player {self.player_id+1}")
+                    
+                    # Add message to queue
+                    self.messages.append(data)
+                except Exception as e:
+                    print(f"Error receiving: {e}")
+                    self.connected = False
+                    break
+        except:
+            pass
+        print("Receive thread ended")
+    
+    def send_message(self, message):
+        if not self.connected:
+            return False
+        
+        try:
+            self.socket.send(message.encode())
+            return True
+        except Exception as e:
+            print(f"Send error: {e}")
+            self.connected = False
+            return False
+    
+    def place_ships(self, ships_data):
+        """Send ship placements - simplified for testing"""
+        return self.send_message("SHIPS|" + ships_data)
+    
+    def fire_shot(self, row, col):
+        """Send a shot with row and column coordinates"""
+        return self.send_message(f"FIRE {row} {col}|")  # Note the space separator
+    
+    def get_message(self):
+        """Get next message from queue"""
+        if self.messages:
+            return self.messages.pop(0)
+        return None
+    
+    def is_connected(self):
+        return self.connected
