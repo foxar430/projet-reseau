@@ -1,7 +1,8 @@
 # projet-reseau
 
 
-le modele ia a ete entraine et voici ses stat et ses derniers resulat: 
+le modele ia a ete entraine on a eu recours a pytorch et numpy pour concevoir l'architecture de neurone ainsi que l'entrainement et pour les graph matplotlib 
+et voici ses derniers resulat
 
 ![fig3](https://github.com/user-attachments/assets/f550bc1f-380b-4adc-84a9-9e98f3847583)
 
