@@ -37,6 +37,8 @@ MENU = 0
 SETUP = 1
 GAMEPLAY = 2
 GAME_OVER = 3
+ONLINE_SETUP = 4
+ONLINE_WAITING = 5
 
 class Ship:
     def __init__(self, size, name):
@@ -314,7 +316,7 @@ class Board:
                                 self.y + start_row * CELL_SIZE, 
                                 CELL_SIZE)
         
-        # For gameplay, highlight sunk ships even on opponent's board
+        # For gameplay, highlight sunk ships
         for ship in self.ships:
             if ship.sunk:
                 # Add a special marker for sunk ships
@@ -325,15 +327,17 @@ class Board:
                         self.y + row * CELL_SIZE + CELL_SIZE // 2
                     )
                     
-                    # Draw orange outline for sunk ship cells
-                    sunk_rect = pygame.Rect(
-                        self.x + col * CELL_SIZE + 2, 
-                        self.y + row * CELL_SIZE + 2,
-                        CELL_SIZE - 4, CELL_SIZE - 4
-                    )
-                    pygame.draw.rect(screen, ORANGE, sunk_rect, 2, border_radius=3)
+                    # Draw orange outline for sunk ship cells only if ships aren't hidden
+                    # Or if it's a shot location (the player has already hit this spot)
+                    if not hide_ships or (row, col) in self.shots:
+                        sunk_rect = pygame.Rect(
+                            self.x + col * CELL_SIZE + 2, 
+                            self.y + row * CELL_SIZE + 2,
+                            CELL_SIZE - 4, CELL_SIZE - 4
+                        )
+                        pygame.draw.rect(screen, ORANGE, sunk_rect, 2, border_radius=3)
                     
-                    # Draw sunk indicator text "X"
+                    # Draw sunk indicator text "✓" only for visible ships
                     if not hide_ships:
                         small_font = pygame.font.Font(None, 28)
                         sunk_text = small_font.render("✓", True, ORANGE)
@@ -517,8 +521,6 @@ class Game:
                   lambda: self.start_ai_game()),
             Button(250, 350, 500, 50, "Start with Random Ship Placement", LIGHT_BLUE, BLUE, BLACK, 
                   lambda: self.start_random_game()),
-            Button(250, 400, 500, 50, "Online Multiplayer", LIGHT_BLUE, BLUE, BLACK, 
-                  lambda: self.start_online_game()),
             Button(250, 650, 500, 50, "Quit", RED, (200, 0, 0), WHITE, 
                   lambda: self.quit_game())
         ]
@@ -535,6 +537,23 @@ class Game:
         
         # Track mouse position
         self.mouse_pos = (0, 0)
+
+        # Online game variables
+        self.network = None
+        self.is_online_game = False
+        self.online_player_num = None
+        self.opponent_name = "Opponent"
+        self.active_input_field = None  # Can be "ip", "port", or "name"
+        self.server_ip_input = "127.0.0.1"
+        self.server_port_input = "8888"
+        self.player_name_input = "Player"
+        self.connection_status = ""
+        
+        # Ajouter un bouton pour le mode en ligne
+        self.menu_buttons.append(
+            Button(250, 400, 500, 50, "Online Multiplayer", LIGHT_BLUE, BLUE, BLACK, 
+                   lambda: self.show_connect_screen())
+        )
     
     def start_pvp_game(self):
         self.state = SETUP
@@ -573,28 +592,6 @@ class Game:
         self.state = GAMEPLAY
         self.current_player = 1
         self.message = "Game started! Player 1's turn"
-        self.message_timer = 3000
-        return True
-    
-    def start_online_game(self):
-        """Start an online multiplayer game"""
-        from simple_client import SimpleClient
-        
-        self.reset_game()
-        self.is_online = True
-        
-        # Connect to server
-        self.network = SimpleClient()
-        if not self.network.connect():
-            self.message = "Failed to connect to server!"
-            self.message_timer = 3000
-            self.is_online = False
-            return False
-        
-        # Start game setup
-        self.state = SETUP
-        self.current_player = 1
-        self.message = "Place your ships for online match!"
         self.message_timer = 3000
         return True
     
@@ -651,19 +648,14 @@ class Game:
         self.ai_player = None
         self.ai_thinking = False
         self.ai_move_timer = 0
-        self.ai_auto_place = True  # Flag to ensure AI places ships automatically
-        
-        # Add these online-related properties
-        self.is_online = False
-        self.network = None
-        self.player_id = None
     
     def rotate_ship(self):
         if self.selected_ship:
             self.ship_horizontal = not self.ship_horizontal
-            self.message = f"Rotated ship to {'horizontal' if self.ship_horizontal else 'vertical'}"
+            self.message = "Ship rotated"
             self.message_timer = 1000
-        return True
+            return True
+        return False
     
     def random_placement(self):
         if self.current_player == 1:
@@ -695,19 +687,29 @@ class Game:
         return True
     
     def handle_setup_click(self, pos):
+        # Déterminer quel plateau et quels navires utiliser
+        if self.is_online_game:
+            # En mode en ligne, chaque joueur ne peut interagir qu'avec son propre plateau
+            if self.online_player_num == 1:
+                board = self.board1
+                remaining_ships = self.remaining_ships1
+            else:  # Player 2
+                board = self.board2
+                remaining_ships = self.remaining_ships2
+        else:
+            # Pour les modes non-en ligne, conserver le comportement existant
+            if self.current_player == 1:
+                board = self.board1
+                remaining_ships = self.remaining_ships1
+            else:
+                board = self.board2
+                remaining_ships = self.remaining_ships2
+        
         # Check if any setup buttons were clicked
         for button in self.setup_buttons:
             if button.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, 
-                                                   {'pos': pos, 'button': 1})):
+                                                    {'pos': pos, 'button': 1})):
                 return
-        
-        # Determine which board was clicked
-        if self.current_player == 1:
-            board = self.board1
-            remaining_ships = self.remaining_ships1
-        else:
-            board = self.board2
-            remaining_ships = self.remaining_ships2
         
         # Check if the click is within the board
         if (board.x <= pos[0] <= board.x + board.size * CELL_SIZE and
@@ -720,28 +722,38 @@ class Game:
             # Try to place selected ship
             if self.selected_ship:
                 if board.place_ship(self.selected_ship, grid_y, grid_x, self.ship_horizontal):
+                    old_ship = self.selected_ship  # Save reference
                     remaining_ships.remove(self.selected_ship)
-                    self.selected_ship = None
+                    self.selected_ship = None if not remaining_ships else remaining_ships[0]
+                    
+                    # For online mode, notify the server about ship placement
+                    if self.is_online_game:
+                        self.network.send_message({
+                            "type": "ship_placement",
+                            "player_num": self.online_player_num,
+                            "ship": {
+                                "name": old_ship.name,
+                                "size": old_ship.size,
+                                "row": grid_y,
+                                "col": grid_x,
+                                "horizontal": self.ship_horizontal
+                            }
+                        })
                     
                     # Check if all ships are placed
                     if not remaining_ships:
                         self.setup_complete[self.current_player - 1] = True
                         
-                        # For online games, send ship placement to server
-                        if self.is_online:
-                            # Tell server we've placed ships
-                            print("Sending ship placement to server")
-                            self.network.send_message("SHIPS|")
-                            
-                            # Don't change state yet - wait for server to tell us
-                            self.message = "Waiting for server confirmation..."
+                        # Handle online setup completion
+                        if self.is_online_game:
+                            self.network.send_message({
+                                "type": "setup_complete",
+                                "player_num": self.online_player_num
+                            })
+                            self.message = "Waiting for opponent to finish setup..."
                             self.message_timer = 3000
-                            return
-                        
-                        # The rest of your existing code for non-online games
-                        if self.current_player == 1:
+                        elif self.current_player == 1:
                             if self.is_ai_game:
-                                print("Auto-placing AI ships...")  # Debug message
                                 # AI setup - automatically place ships randomly
                                 self.board2.place_ships_randomly(self.ships2)
                                 self.setup_complete[1] = True
@@ -749,7 +761,6 @@ class Game:
                                 self.current_player = 1
                                 self.message = "Game started! Your turn"
                                 self.message_timer = 3000
-                                return  # Add this return to prevent any further processing
                             else:
                                 # Regular PvP setup
                                 self.current_player = 2
@@ -765,51 +776,46 @@ class Game:
                     self.message_timer = 2000
         
         # Check if ship selection buttons were clicked
-        if self.current_player == 1:
-            if 800 <= pos[0] <= 950:
-                for i, ship in enumerate(remaining_ships):
-                    if 150 + i * 50 <= pos[1] <= 190 + i * 50:
-                        self.selected_ship = ship
-                        self.message = f"Selected {ship.name} (size {ship.size})"
-                        self.message_timer = 2000
-        else:
-            if 50 <= pos[0] <= 200:
-                for i, ship in enumerate(remaining_ships):
-                    if 150 + i * 50 <= pos[1] <= 190 + i * 50:
-                        self.selected_ship = ship
-                        self.message = f"Selected {ship.name} (size {ship.size})"
-                        self.message_timer = 2000
+        if 800 <= pos[0] <= 950:
+            for i, ship in enumerate(remaining_ships):
+                if 150 + i * 50 <= pos[1] <= 190 + i * 50:
+                    self.selected_ship = ship
+                    self.message = f"Selected {ship.name} (size {ship.size})"
+                    self.message_timer = 2000
     
     def handle_gameplay_click(self, pos):
-        # Determine which board to target
-        if self.current_player == 1:
-            # Player 1 targets board 2
-            target_board = self.board2
-            grid_x = (pos[0] - self.board2.x) // CELL_SIZE
-            grid_y = (pos[1] - self.board2.y) // CELL_SIZE
-        else:
-            # Player 2 targets board 1
-            target_board = self.board1
-            grid_x = (pos[0] - self.board1.x) // CELL_SIZE
-            grid_y = (pos[1] - self.board1.y) // CELL_SIZE
+        # Prevent clicks when it's not your turn in online mode
+        if self.is_online_game and self.current_player != self.online_player_num:
+            self.message = "Not your turn!"
+            self.message_timer = 2000
+            return
         
-        # Check if click is on the grid
-        if 0 <= grid_x < GRID_SIZE and 0 <= grid_y < GRID_SIZE:
-            # For online games, send shot to server
-            if self.is_online:
-                # Only allow if it's our turn
-                if self.current_player != self.player_id + 1:
-                    self.message = "Not your turn!"
-                    self.message_timer = 2000
-                    return
-                    
-                # Send shot to server
-                self.network.fire_shot(grid_y, grid_x)
-                self.message = "Shot sent to server..."
-                self.message_timer = 1000
+        # For AI games, prevent clicks during AI's turn
+        if self.is_ai_game and self.current_player == self.ai_player:
+            return
+
+        # Determine which board to target
+        target_board = self.board2 if self.current_player == 1 else self.board1
+        
+        # Check if the click is within the target board
+        if (target_board.x <= pos[0] <= target_board.x + target_board.size * CELL_SIZE and
+            target_board.y <= pos[1] <= target_board.y + target_board.size * CELL_SIZE):
+            
+            # Calculate grid position
+            grid_x = (pos[0] - target_board.x) // CELL_SIZE
+            grid_y = (pos[1] - target_board.y) // CELL_SIZE
+            
+            # For online gameplay, send shot to server
+            if self.is_online_game:
+                self.network.send_message({
+                    "type": "shot",
+                    "player_num": self.online_player_num,
+                    "row": grid_y,
+                    "col": grid_x
+                })
                 return
-                
-            # Regular local game shot processing
+            
+            # Process shot locally for non-online games
             result = target_board.receive_shot(grid_y, grid_x)
             
             if result == "already_shot":
@@ -871,11 +877,36 @@ class Game:
                         self.handle_gameplay_click(event.pos)
                     elif self.state == GAME_OVER:
                         self.handle_game_over_click(event.pos)
+                    elif self.state == ONLINE_SETUP:
+                        # First check for buttons
+                        button_clicked = False
+                        for x, y, w, h, action in [
+                            (SCREEN_WIDTH // 2 - 75, 350, 150, 40, self.connect_to_server),  # Connect
+                            (50, SCREEN_HEIGHT - 70, 100, 40, self.back_to_menu)  # Back
+                        ]:
+                            if x <= event.pos[0] <= x + w and y <= event.pos[1] <= y + h:
+                                action()
+                                button_clicked = True
+                                break
+                        
+                        # If no button clicked, check for text fields
+                        if not button_clicked:
+                            self.handle_connect_screen_click(event.pos)
+                            
+                    elif self.state == ONLINE_WAITING:
+                        # Check for cancel button
+                        if (SCREEN_WIDTH // 2 - 75 <= event.pos[0] <= SCREEN_WIDTH // 2 + 75 and
+                            400 <= event.pos[1] <= 440):
+                            self.back_to_menu()
             
             elif event.type == pygame.KEYDOWN:
                 # Add keyboard shortcut for rotation (R key)
                 if event.key == pygame.K_r and self.state == SETUP and self.selected_ship:
                     self.rotate_ship()
+                
+                # Handle text input for online setup
+                if self.state == ONLINE_SETUP:
+                    self.handle_connect_screen_event(event)
     
     def draw_menu(self):
         # Create lighter gradient background
@@ -916,51 +947,54 @@ class Game:
             color = (220, 230, 240, 255)
             pygame.draw.rect(self.screen, color, (0, y, SCREEN_WIDTH, 1))
         
-        # Draw setup title with shadow
-        if self.current_player == 1:
-            title = f"Player 1: Place Your Ships"
-            board = self.board1
-            remaining_ships = self.remaining_ships1
-            sidebar_x = 800  # Right side for Player 1
+        # Déterminer quel joueur et quel plateau afficher
+        if self.is_online_game:
+            # En mode en ligne, chaque joueur voit uniquement son plateau
+            if self.online_player_num == 1:
+                title = f"Player 1: Place Your Ships (vs {self.opponent_name})"
+                board = self.board1
+                remaining_ships = self.remaining_ships1
+            else:  # Player 2
+                title = f"Player 2: Place Your Ships (vs {self.opponent_name})"
+                board = self.board2
+                remaining_ships = self.remaining_ships2
         else:
-            title = f"Player 2: Place Your Ships"
-            board = self.board2
-            remaining_ships = self.remaining_ships2
-            sidebar_x = 50  # Left side for Player 2
+            # Pour les autres modes, conserver le comportement existant
+            if self.current_player == 1:
+                title = "Player 1: Place Your Ships"
+                board = self.board1
+                remaining_ships = self.remaining_ships1
+            else:
+                title = "Player 2: Place Your Ships"
+                board = self.board2
+                remaining_ships = self.remaining_ships2
         
+        # Draw setup title with shadow
         title_shadow = self.font.render(title, True, BLACK)
         title_text = self.font.render(title, True, BLUE)
         self.screen.blit(title_shadow, (SCREEN_WIDTH // 2 - title_text.get_width() // 2 + 1, 11))
         self.screen.blit(title_text, (SCREEN_WIDTH // 2 - title_text.get_width() // 2, 10))
         
-        # Update and draw the active player's board for setup
+        # Draw board with current player's selection
         mouse_pos = pygame.mouse.get_pos()
+        
+        # Update and draw the active player's board for setup
         board.update(self.clock.get_time(), mouse_pos)
         board.draw(self.screen, hide_ships=False, selected_ship=self.selected_ship, 
                  is_horizontal=self.ship_horizontal)
         
-        # Draw ship selection sidebar at the correct position
-        pygame.draw.rect(self.screen, LIGHT_BLUE, (sidebar_x, 100, 150, 400), 0, border_radius=8)
-        pygame.draw.rect(self.screen, NAVY, (sidebar_x, 100, 150, 400), 2, border_radius=8)
+        # Draw ship selection sidebar
+        pygame.draw.rect(self.screen, LIGHT_BLUE, (800, 100, 150, 400), 0, border_radius=8)
+        pygame.draw.rect(self.screen, NAVY, (800, 100, 150, 400), 2, border_radius=8)
         ship_select_text = self.font.render("Select Ship:", True, BLACK)
-        self.screen.blit(ship_select_text, (sidebar_x + 25, 110))
+        self.screen.blit(ship_select_text, (825, 110))
         
-        # Draw available ships at the correct position
+        # Draw available ships
         for i, ship in enumerate(remaining_ships):
             is_selected = self.selected_ship == ship
-            ship.draw(self.screen, sidebar_x + 25, 150 + i * 50, 20, is_selected)
+            ship.draw(self.screen, 825, 150 + i * 50, 20, is_selected)
             ship_name = self.font.render(ship.name, True, BLACK)
-            self.screen.blit(ship_name, (sidebar_x + 25 + ship.size * 20 + 10, 160 + i * 50))
-        
-        # Also adjust buttons and text based on sidebar position
-        if self.current_player == 1:
-            button_x = 825
-        else:
-            button_x = 75
-        
-        # Update button positions
-        self.setup_buttons[0].rect.x = button_x  # Rotate button
-        self.setup_buttons[1].rect.x = button_x  # Random button
+            self.screen.blit(ship_name, (825 + ship.size * 20 + 10, 160 + i * 50))
         
         # Draw setup buttons (rotate & random)
         for button in self.setup_buttons:
@@ -968,78 +1002,75 @@ class Game:
         
         # Show rotation indicator
         orientation = "Horizontal" if self.ship_horizontal else "Vertical"
-        orient_text = self.font.render(f"Orientation: {orientation}", True, BLACK)
-        orient_rect = pygame.Rect(sidebar_x, 410, 150, 30)
-        pygame.draw.rect(self.screen, LIGHT_GRAY, orient_rect, 0, border_radius=5)
-        self.screen.blit(orient_text, (sidebar_x + 25, 415))
-        
-        # Show keyboard shortcut hint
-        if self.selected_ship:
-            hint_text = self.font.render("Press 'R' to rotate", True, (50, 50, 50))
-            self.screen.blit(hint_text, (sidebar_x + 20, 520))
+        orientation_text = self.font.render(f"Orientation: {orientation}", True, BLACK)
+        self.screen.blit(orientation_text, (825, 500))
     
     def draw_gameplay(self):
-        # Fill with gradient background
-        self.screen.fill(WHITE)
-        for y in range(SCREEN_HEIGHT):
-            color = (240, 248, 255)
-            pygame.draw.rect(self.screen, color, (0, y, SCREEN_WIDTH, 1))
-        
-        # Draw player labels with shadow effect
-        player1_text = self.font.render("Your Board" if self.is_ai_game else "Player 1's Board", True, BLUE)
-        player2_text = self.font.render("AI's Board" if self.is_ai_game else "Player 2's Board", True, BLUE)
-        
-        # Draw label backgrounds
-        label1_rect = pygame.Rect(GRID_PADDING + 20, 5, player1_text.get_width() + 60, 30)
-        label2_rect = pygame.Rect(SCREEN_WIDTH // 2 + GRID_PADDING + 20, 5, 
-                               player2_text.get_width() + 60, 30)
-        
-        pygame.draw.rect(self.screen, LIGHT_BLUE, label1_rect, 0, border_radius=5)
-        pygame.draw.rect(self.screen, LIGHT_BLUE, label2_rect, 0, border_radius=5)
-        
-        # Draw active player indicator
-        if self.current_player == 1:
-            pygame.draw.rect(self.screen, GREEN, label1_rect, 3, border_radius=5)
-            pygame.draw.rect(self.screen, GRAY, label2_rect, 1, border_radius=5)
-        else:
-            pygame.draw.rect(self.screen, GRAY, label1_rect, 1, border_radius=5)
-            pygame.draw.rect(self.screen, GREEN, label2_rect, 3, border_radius=5)
-        
-        self.screen.blit(player1_text, (GRID_PADDING + 50, 10))
-        self.screen.blit(player2_text, (SCREEN_WIDTH // 2 + GRID_PADDING + 50, 10))
-        
-        # Draw current player indicator
-        current_text = None
-        if self.is_ai_game:
-            if self.current_player == 1:
-                current_text = self.big_font.render("Your Turn", True, RED)
+        # Déterminer quel texte afficher pour le tour actuel
+        if self.is_online_game:
+            # En mode en ligne, afficher clairement de qui est le tour
+            if self.current_player == self.online_player_num:
+                current_text = self.big_font.render("YOUR TURN", True, GREEN)
             else:
-                current_text = self.big_font.render("AI's Turn", True, RED)
-        else:
-            current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
-        mouse_pos = pygame.mouse.get_pos()
-        if self.current_player == 1:
-            # When player 1's turn, update hover on player 2's board
-            self.board1.update(self.clock.get_time())
-            self.board2.update(self.clock.get_time(), mouse_pos)
-        else:
-            # When player 2's turn, update hover on player 1's board
-            self.board1.update(self.clock.get_time(), mouse_pos)
-            self.board2.update(self.clock.get_time())
+                current_text = self.big_font.render(f"{self.opponent_name}'S TURN", True, RED)
+                
+            # Déterminer quels plateaux afficher
+            my_board = self.board1 if self.online_player_num == 1 else self.board2
+            opponent_board = self.board2 if self.online_player_num == 1 else self.board1
             
-        # Draw boards
-        if self.is_ai_game:
-            # In AI games, player should always see their ships but never the AI's ships
-            self.board1.draw(self.screen, hide_ships=False)  # Player's board - always show ships
-            self.board2.draw(self.screen, hide_ships=True)   # AI's board - always hide ships
+            # Mise à jour des plateaux (hover effects)
+            if self.current_player == self.online_player_num:
+                # Quand c'est mon tour, je vise le plateau adverse
+                my_board.update(self.clock.get_time())
+                opponent_board.update(self.clock.get_time(), self.mouse_pos)
+            else:
+                # Quand c'est le tour de l'adversaire, aucun hover effect
+                my_board.update(self.clock.get_time())
+                opponent_board.update(self.clock.get_time())
+            
+            # Dessiner les étiquettes
+            my_label = self.font.render("YOUR BOARD", True, NAVY)
+            opp_label = self.font.render(f"{self.opponent_name}'S BOARD", True, NAVY)
+            
+            # Afficher les étiquettes
+            self.screen.blit(my_label, (my_board.x + my_board.size * CELL_SIZE // 2 - my_label.get_width() // 2, my_board.y - 40))
+            self.screen.blit(opp_label, (opponent_board.x + opponent_board.size * CELL_SIZE // 2 - opp_label.get_width() // 2, opponent_board.y - 40))
+            
+            # Dessiner les plateaux - toujours afficher mes navires, jamais ceux de l'adversaire
+            my_board.draw(self.screen, hide_ships=False)  # Mes navires sont toujours visibles
+            opponent_board.draw(self.screen, hide_ships=True)  # Les navires adverses sont toujours cachés
+            
+            # Dessiner l'affichage de statut des navires
+            if self.online_player_num == 1:
+                self.status_display1.draw(self.screen, self.font, self.ships1, opponent=False)
+                self.status_display2.draw(self.screen, self.font, self.ships2, opponent=True)
+            else:
+                self.status_display1.draw(self.screen, self.font, self.ships1, opponent=True)
+                self.status_display2.draw(self.screen, self.font, self.ships2, opponent=False)
         else:
-            # Regular PvP game - hide ships based on current player
+            # Mode local ou IA - conserver le comportement existant
+            if self.is_ai_game:
+                current_text = self.big_font.render("Your Turn" if self.current_player == 1 else "AI's Turn", True, RED)
+            else:
+                current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
+            
+            # Mise à jour des hover effects selon le joueur actuel
+            if self.current_player == 1:
+                # Quand c'est le tour du joueur 1, il cible le plateau du joueur 2
+                self.board1.update(self.clock.get_time())
+                self.board2.update(self.clock.get_time(), self.mouse_pos)
+            else:
+                # Quand c'est le tour du joueur 2, il cible le plateau du joueur 1
+                self.board1.update(self.clock.get_time(), self.mouse_pos)
+                self.board2.update(self.clock.get_time())
+            
+            # Dessiner les plateaux avec visibilité des navires selon le joueur actuel
             self.board1.draw(self.screen, hide_ships=self.current_player == 2)
             self.board2.draw(self.screen, hide_ships=self.current_player == 1)
-        
-        # Draw ship status displays
-        self.status_display1.draw(self.screen, self.font, self.ships1, opponent=self.current_player == 2)
-        self.status_display2.draw(self.screen, self.font, self.ships2, opponent=self.current_player == 1)
+            
+            # Dessiner l'affichage de statut des navires
+            self.status_display1.draw(self.screen, self.font, self.ships1, opponent=self.current_player == 2)
+            self.status_display2.draw(self.screen, self.font, self.ships2, opponent=self.current_player == 1)
         
         # Draw message
         if self.message and self.message_timer > 0:
@@ -1050,6 +1081,7 @@ class Game:
             pygame.draw.rect(self.screen, BLACK, msg_bg, 1, border_radius=5)
             self.screen.blit(msg_text, (SCREEN_WIDTH // 2 - msg_text.get_width() // 2, 655))
         
+        # Afficher le texte indiquant le tour actuel
         self.screen.blit(current_text, (SCREEN_WIDTH // 2 - current_text.get_width() // 2, 600))
     
     def draw_game_over(self):
@@ -1095,18 +1127,105 @@ class Game:
         for button in self.gameover_buttons:
             button.draw(self.screen, self.font)
     
+    def draw_connect_screen(self):
+        """Draw the connection setup screen"""
+        # Background
+        self.screen.fill(LIGHT_BLUE)
+        
+        # Title
+        title = self.big_font.render("Online Multiplayer", True, NAVY)
+        self.screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 50))
+        
+        # Connection form
+        form_width = 400
+        form_height = 300
+        form_x = SCREEN_WIDTH // 2 - form_width // 2
+        form_y = 150
+        
+        pygame.draw.rect(self.screen, WHITE, (form_x, form_y, form_width, form_height), 0, border_radius=10)
+        pygame.draw.rect(self.screen, NAVY, (form_x, form_y, form_width, form_height), 2, border_radius=10)
+        
+        # Form fields
+        y_offset = form_y + 30
+        
+        # Server IP
+        ip_label = self.font.render("Server IP:", True, BLACK)
+        self.screen.blit(ip_label, (form_x + 30, y_offset))
+        
+        # IP input field - highlight if active
+        ip_field_color = YELLOW if self.active_input_field == "ip" else LIGHT_GRAY
+        pygame.draw.rect(self.screen, ip_field_color, (form_x + 150, y_offset - 5, 200, 30), 0, border_radius=5)
+        ip_text = self.font.render(self.server_ip_input, True, BLACK)
+        self.screen.blit(ip_text, (form_x + 160, y_offset))
+        
+        # Server Port
+        y_offset += 50
+        port_label = self.font.render("Server Port:", True, BLACK)
+        self.screen.blit(port_label, (form_x + 30, y_offset))
+        
+        # Port input field - highlight if active
+        port_field_color = YELLOW if self.active_input_field == "port" else LIGHT_GRAY
+        pygame.draw.rect(self.screen, port_field_color, (form_x + 150, y_offset - 5, 200, 30), 0, border_radius=5)
+        port_text = self.font.render(self.server_port_input, True, BLACK)
+        self.screen.blit(port_text, (form_x + 160, y_offset))
+        
+        # Player Name
+        y_offset += 50
+        name_label = self.font.render("Your Name:", True, BLACK)
+        self.screen.blit(name_label, (form_x + 30, y_offset))
+        
+        # Name input field - highlight if active
+        name_field_color = YELLOW if self.active_input_field == "name" else LIGHT_GRAY
+        pygame.draw.rect(self.screen, name_field_color, (form_x + 150, y_offset - 5, 200, 30), 0, border_radius=5)
+        name_text = self.font.render(self.player_name_input, True, BLACK)
+        self.screen.blit(name_text, (form_x + 160, y_offset))
+        
+        # Connect button
+        y_offset += 80
+        connect_button = Button(
+            form_x + form_width // 2 - 75, y_offset,
+            150, 40, "Connect", GREEN, (0, 200, 0), WHITE,
+            lambda: self.connect_to_server()
+        )
+        connect_button.update(self.mouse_pos)
+        connect_button.draw(self.screen, self.font)
+        
+        # Back button
+        back_button = Button(
+            50, SCREEN_HEIGHT - 70,
+            100, 40, "Back", RED, (200, 0, 0), WHITE,
+            lambda: self.back_to_menu()
+        )
+        back_button.update(self.mouse_pos)
+        back_button.draw(self.screen, self.font)
+        
+        # Status message
+        status_text = self.font.render(self.connection_status, True, RED)
+        self.screen.blit(status_text, (SCREEN_WIDTH // 2 - status_text.get_width() // 2, form_y + form_height + 20))
+    
+    def draw_waiting_screen(self):
+        """Draw waiting for opponent screen"""
+        self.screen.fill(LIGHT_BLUE)
+        
+        # Title
+        title = self.big_font.render("Waiting for Opponent", True, NAVY)
+        self.screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 200))
+        
+        # Animated dots for waiting indicator
+        dots = "." * (int(pygame.time.get_ticks() / 500) % 4)
+        waiting_text = self.big_font.render(f"Please wait{dots}", True, BLACK)
+        self.screen.blit(waiting_text, (SCREEN_WIDTH // 2 - waiting_text.get_width() // 2, 300))
+        
+        # Cancel button
+        cancel_button = Button(
+            SCREEN_WIDTH // 2 - 75, 400,
+            150, 40, "Cancel", RED, (200, 0, 0), WHITE,
+            lambda: self.back_to_menu()
+        )
+        cancel_button.update(self.mouse_pos)
+        cancel_button.draw(self.screen, self.font)
+    
     def update(self):
-        # Add this safety check first
-        if self.state == SETUP and self.current_player == 2 and self.is_ai_game:
-            # Force AI to place ships randomly
-            print("Safety trigger: Auto-placing AI ships...")
-            self.board2.place_ships_randomly(self.ships2)
-            self.setup_complete[1] = True
-            self.state = GAMEPLAY
-            self.current_player = 1
-            self.message = "Game started! Your turn"
-            self.message_timer = 3000
-
         # Update message timer
         if self.message_timer > 0:
             self.message_timer -= self.clock.get_time()
@@ -1134,60 +1253,6 @@ class Game:
             if self.ai_move_timer >= 800:  # 800ms delay
                 self.ai_move_timer = 0
                 self.make_ai_move()
-        
-        # Add this at the end of the method
-        # Handle online game network messages
-        if self.is_online and hasattr(self, 'network') and self.network.is_connected():
-            message = self.network.get_message()
-            if message:
-                self.handle_network_message(message)
-        
-        # Add to your update method
-        if self.is_online and hasattr(self, 'network') and self.network.is_connected():
-            message = self.network.get_message()
-            if message:
-                parts = message.split('|')
-                cmd = parts[0]
-                
-                if cmd == "PLAYER":
-                    self.player_id = int(parts[1])
-                    print(f"You are Player {self.player_id+1}")
-                
-                elif cmd == "START":
-                    self.message = "Game started! Place your ships."
-                    self.message_timer = 3000
-                
-                elif cmd == "READY":
-                    self.state = GAMEPLAY
-                    first_player = int(parts[1])
-                    self.current_player = first_player
-                    self.message = "Game started! " + ("Your turn" if first_player == self.player_id else "Opponent's turn")
-                    self.message_timer = 3000
-                
-                elif cmd == "SHOT":
-                    shooter = int(parts[1])
-                    row, col = int(parts[2]), int(parts[3])
-                    result = parts[4]
-                    
-                    # Update game state
-                    if shooter == self.player_id:
-                        # Your shot
-                        self.board2.grid[row][col] = 'X' if result == "HIT" else 'M'
-                        self.message = f"{result}!"
-                    else:
-                        # Opponent's shot
-                        self.board1.grid[row][col] = 'X' if result == "HIT" else 'M'
-                        self.message = f"Opponent's shot: {result}!"
-                    
-                    self.message_timer = 2000
-                    self.current_player = 1 if shooter == 0 else 0
-                
-                elif cmd == "QUIT":
-                    quitter = int(parts[1])
-                    self.message = "Opponent disconnected!"
-                    self.message_timer = 3000
-                    self.state = MENU
-                    self.is_online = False
     
     def make_ai_move(self):
         """Execute the AI's turn"""
@@ -1261,89 +1326,211 @@ class Game:
         
         return BoardAdapter(game_board)
     
+    def show_connect_screen(self):
+        """Switch to online connection setup screen"""
+        self.state = ONLINE_SETUP
+        return True
+
+    def connect_to_server(self):
+        """Connect to the battleship server"""
+        try:
+            # Import connection client here to avoid circular imports
+            from client import NetworkClient
+            
+            self.connection_status = "Connecting..."
+            
+            # Create network client and connect
+            self.network = NetworkClient(self.handle_network_message)
+            connection_success = self.network.connect(
+                self.server_ip_input, 
+                int(self.server_port_input), 
+                self.player_name_input
+            )
+            
+            if connection_success:
+                self.connection_status = "Connected! Waiting for opponent..."
+                self.is_online_game = True
+                self.state = ONLINE_WAITING
+                return True
+            else:
+                self.connection_status = "Connection failed!"
+                return False
+        except Exception as e:
+            self.connection_status = f"Error: {str(e)}"
+            return False
+
     def handle_network_message(self, message):
         """Process messages from the server"""
-        print(f"Processing network message: {message}")
+        message_type = message.get("type")
+        print(f"Received message: {message_type}")
         
-        # Parse the string message format
-        parts = message.split('|')
-        message_type = parts[0]
+        if message_type == "connected":
+            self.connection_status = "Connected to server"
         
-        if message_type == "PING":
-            # Respond to keep-alive pings
-            self.network.send_message("PONG|")
-            return
-        
-        if message_type == "PLAYER":
-            self.player_id = int(parts[1])
-            print(f"You are Player {self.player_id + 1}")
-        
-        elif message_type == "START":
-            self.message = "Game started! Place your ships."
+        elif message_type == "session_start":
+            # Session started, get player info
+            self.online_player_num = message.get("player_num")
+            self.opponent_name = message.get("opponent", "Opponent")
+            
+            # Reset game and set up for online play
+            self.reset_game()
+            self.is_online_game = True
+            self.state = SETUP
+            
+            # Set message based on player number
+            self.message = f"You are Player {self.online_player_num}. Place your ships!"
             self.message_timer = 3000
         
-        elif message_type == "WAIT":
-            self.message = "Waiting for other player to place ships..."
+        elif message_type == "waiting_for_opponent":
+            self.state = ONLINE_WAITING
+            self.connection_status = "Waiting for an opponent..."
+        
+        elif message_type == "gameplay_start":
+            self.state = GAMEPLAY
+            self.current_player = message.get("current_player", 1)
+            self.message = "Game started!"
             self.message_timer = 3000
         
-        elif message_type == "YOURPLACEMENT":
-            self.message = "Your turn to place ships!"
-            self.message_timer = 3000
+        elif message_type == "receive_shot":
+            row = message.get("row")
+            col = message.get("col")
+            player = message.get("player")
+            
+            # Process shot on your board
+            my_board = self.board1 if self.online_player_num == 1 else self.board2
+            result = my_board.receive_shot(row, col)
+            
+            # Send result back to server
+            self.network.send_message({
+                "type": "shot_result",
+                "player_num": player,
+                "row": row,
+                "col": col,
+                "result": result
+            })
         
-        elif message_type == "GAMESTART":
-            if len(parts) > 1:
-                first_player = int(parts[1])
-                self.state = GAMEPLAY
-                self.current_player = first_player + 1  # Convert to 1-based player number
-                self.message = "Game started! " + ("Your turn" if first_player == self.player_id else "Opponent's turn")
-                self.message_timer = 3000
-                print(f"Game starting with player {first_player+1} going first")
-        
-        elif message_type == "SHOT":
-            if len(parts) >= 5:
-                shooter = int(parts[1])
-                row, col = int(parts[2]), int(parts[3])
-                result = parts[4]
+        elif message_type == "shot_result":
+            player = message.get("player")
+            row = message.get("row")
+            col = message.get("col")
+            result = message.get("result")
+            
+            # Update message based on result
+            if player == self.online_player_num:
+                attacker = "You"
+            else:
+                attacker = "Opponent"
                 
-                # Update the appropriate board
-                if shooter == self.player_id:
-                    # Your shot at opponent's board
-                    if result == "HIT":
-                        self.board2.grid[row][col] = 'X'
-                    else:
-                        self.board2.grid[row][col] = 'M'
-                    self.message = f"{result}!"
-                else:
-                    # Opponent's shot at your board
-                    if result == "HIT":
-                        self.board1.grid[row][col] = 'X'
-                    else:
-                        self.board1.grid[row][col] = 'M'
-                    self.message = f"Opponent's shot: {result}!"
-                
+            if result == "hit":
+                self.message = f"{attacker} hit!"
                 self.message_timer = 2000
-                
-                # Update turn (convert from 0-based to 1-based)
-                self.current_player = (1 if shooter == 0 else 0) + 1
-                
-                # Add a message to indicate whose turn it is now
-                if self.current_player == self.player_id + 1:
-                    self.message += " Your turn now."
-                else:
-                    self.message += " Opponent's turn now."
+            elif result == "miss":
+                self.message = f"{attacker} missed!"
+                self.message_timer = 2000
+            elif result.startswith("sunk"):
+                ship_name = result.split("_")[1]
+                self.message = f"{attacker} sunk the {ship_name}!"
+                self.message_timer = 3000
         
-        elif message_type == "QUIT":
-            self.message = "Opponent disconnected!"
-            self.message_timer = 3000
-            self.state = MENU
-            self.is_online = False
-    
+        elif message_type == "turn_change":
+            self.current_player = message.get("current_player")
+            if self.current_player == self.online_player_num:
+                self.message = "Your turn!"
+            else:
+                self.message = "Opponent's turn!"
+            self.message_timer = 2000
+        
+        elif message_type == "game_over":
+            winner = message.get("winner")
+            self.winner = winner
+            self.state = GAME_OVER
+        
+        elif message_type == "error":
+            self.connection_status = message.get("message", "Unknown error")
+
+    def back_to_menu(self):
+        """Return to main menu"""
+        self.state = MENU
+        
+        # Disconnect if connected
+        if self.network and self.is_online_game:
+            self.network.disconnect()
+            self.network = None
+            self.is_online_game = False
+        
+        return True
+
+    def handle_connect_screen_click(self, pos):
+        """Handle clicks on input fields in the connect screen"""
+        form_x = SCREEN_WIDTH // 2 - 200
+        form_y = 150
+        
+        # Check if an input field was clicked
+        if form_x + 150 <= pos[0] <= form_x + 350:
+            # IP field
+            if form_y + 25 <= pos[1] <= form_y + 55:
+                self.active_input_field = "ip"
+                return True
+            # Port field
+            elif form_y + 75 <= pos[1] <= form_y + 105:
+                self.active_input_field = "port"
+                return True
+            # Name field
+            elif form_y + 125 <= pos[1] <= form_y + 155:
+                self.active_input_field = "name"
+                return True
+        
+        # If clicked elsewhere, deactivate text input
+        self.active_input_field = None
+        return False
+
+    def handle_connect_screen_event(self, event):
+        """Handle keyboard input for text fields in connection screen"""
+        if event.type == pygame.KEYDOWN:
+            # Handle backspace
+            if event.key == pygame.K_BACKSPACE:
+                if self.active_input_field == "ip" and len(self.server_ip_input) > 0:
+                    self.server_ip_input = self.server_ip_input[:-1]
+                elif self.active_input_field == "port" and len(self.server_port_input) > 0:
+                    self.server_port_input = self.server_port_input[:-1]
+                elif self.active_input_field == "name" and len(self.player_name_input) > 0:
+                    self.player_name_input = self.player_name_input[:-1]
+            
+            # Handle enter key to confirm
+            elif event.key == pygame.K_RETURN:
+                self.connect_to_server()
+            
+            # Handle tab key to switch fields
+            elif event.key == pygame.K_TAB:
+                if self.active_input_field == "ip":
+                    self.active_input_field = "port"
+                elif self.active_input_field == "port":
+                    self.active_input_field = "name"
+                elif self.active_input_field == "name":
+                    self.active_input_field = "ip"
+                else:
+                    self.active_input_field = "ip"
+            
+            # Handle text input
+            elif event.unicode.isprintable():
+                if self.active_input_field == "ip":
+                    if event.unicode in "0123456789.":
+                        self.server_ip_input += event.unicode
+                elif self.active_input_field == "port":
+                    if event.unicode in "0123456789":
+                        self.server_port_input += event.unicode
+                elif self.active_input_field == "name":
+                    if len(self.player_name_input) < 15:  # Limit name length
+                        self.player_name_input += event.unicode
+
     def run(self):
         while True:
             self.handle_events()
             self.update()
             
             # Drawing
+            self.screen.fill(LIGHT_BLUE)
+            
             if self.state == MENU:
                 self.draw_menu()
             elif self.state == SETUP:
@@ -1352,6 +1539,19 @@ class Game:
                 self.draw_gameplay()
             elif self.state == GAME_OVER:
                 self.draw_game_over()
+            elif self.state == ONLINE_SETUP:
+                self.draw_connect_screen()
+            elif self.state == ONLINE_WAITING:
+                self.draw_waiting_screen()
+            
+            # Draw message if active
+            if self.message and self.message_timer > 0:
+                msg_text = self.font.render(self.message, True, BLACK)
+                msg_bg = pygame.Rect(SCREEN_WIDTH // 2 - msg_text.get_width() // 2 - 10, 650,
+                                 msg_text.get_width() + 20, 30)
+                pygame.draw.rect(self.screen, (255, 255, 200), msg_bg, 0, border_radius=5)
+                pygame.draw.rect(self.screen, BLACK, msg_bg, 1, border_radius=5)
+                self.screen.blit(msg_text, (SCREEN_WIDTH // 2 - msg_text.get_width() // 2, 655))
             
             pygame.display.flip()
             self.clock.tick(60)
