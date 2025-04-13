@@ -1,95 +1,130 @@
-import socket
+import asyncio
+import json
 import threading
-import time
+import queue
+import logging
 
-class SimpleClient:
-    def __init__(self, host='localhost', port=5555):
-        self.host = host
-        self.port = port
-        self.socket = None
-        self.player_id = None
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('BattleshipNetwork')
+
+class NetworkClient:
+    def __init__(self, message_callback):
+        self.writer = None
+        self.reader = None
         self.connected = False
-        self.messages = []
-        self.running = True
+        self.message_queue = queue.Queue()
+        self.message_callback = message_callback
+        self.event_loop = None
+        self.network_thread = None
+        self.session_id = None
+        self.player_num = None
+        self.opponent_name = None
     
-    def connect(self):
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.host, self.port))
-            self.connected = True
-            print(f"Connected to server at {self.host}:{self.port}")
-            
-            # Start thread to receive messages
-            thread = threading.Thread(target=self.receive_messages)
-            thread.daemon = True
-            thread.start()
-            
-            return True
-        except Exception as e:
-            print(f"Connection failed: {e}")
-            return False
+    def connect(self, server_ip, server_port, player_name):
+        """Connect to the server in a separate thread"""
+        self.network_thread = threading.Thread(
+            target=self._run_network_thread,
+            args=(server_ip, server_port, player_name),
+            daemon=True
+        )
+        self.network_thread.start()
+        return True
     
-    def disconnect(self):
-        self.running = False
-        if self.socket:
-            try:
-                self.socket.close()
-            except:
-                pass
-        self.connected = False
-    
-    def receive_messages(self):
-        try:
-            while self.running and self.connected:
-                try:
-                    data = self.socket.recv(1024).decode()
-                    if not data:
-                        self.connected = False
-                        break
-                    
-                    print(f"Received: {data}")
-                    parts = data.split('|')
-                    cmd = parts[0]
-                    
-                    if cmd == "PLAYER":
-                        self.player_id = int(parts[1])
-                        print(f"You are Player {self.player_id+1}")
-                    
-                    # Add message to queue
-                    self.messages.append(data)
-                except Exception as e:
-                    print(f"Error receiving: {e}")
-                    self.connected = False
-                    break
-        except:
-            pass
-        print("Receive thread ended")
-    
-    def send_message(self, message):
-        if not self.connected:
-            return False
+    def _run_network_thread(self, server_ip, server_port, player_name):
+        """Run the asyncio event loop in a separate thread"""
+        self.event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.event_loop)
         
         try:
-            self.socket.send(message.encode())
-            return True
+            self.event_loop.run_until_complete(
+                self._connect_async(server_ip, server_port, player_name)
+            )
         except Exception as e:
-            print(f"Send error: {e}")
+            logger.error(f"Network error: {e}")
             self.connected = False
-            return False
+            self.message_callback({"type": "connection_error", "message": str(e)})
     
-    def place_ships(self, ships_data):
-        """Send ship placements - simplified for testing"""
-        return self.send_message("SHIPS|" + ships_data)
+    async def _connect_async(self, server_ip, server_port, player_name):
+        """Establish connection to server and handle communication"""
+        try:
+            print(f"Tentative de connexion à {server_ip}:{server_port}...")
+            self.reader, self.writer = await asyncio.open_connection(server_ip, server_port)
+            
+            # Envoyer le nom du joueur
+            name_message = {"name": player_name}
+            print(f"Envoi du nom: {player_name}")
+            self.writer.write(json.dumps(name_message).encode() + b'\n')
+            await self.writer.drain()
+            
+            self.connected = True
+            self.message_callback({"type": "connected"})
+            
+            # Start sending queued messages
+            process_queue_task = asyncio.create_task(self._process_queue())
+            
+            # Traitement des messages entrants
+            while self.connected:
+                try:
+                    data = await self.reader.readline()
+                    if not data:  # Le serveur a fermé la connexion
+                        print("Serveur déconnecté")
+                        self.connected = False
+                        self.message_callback({"type": "disconnected", "reason": "Serveur déconnecté"})
+                        break
+                    
+                    message = json.loads(data.decode())
+                    print(f"Reçu du serveur: {message.get('type')}")  # Debug
+                    
+                    # Transmettre le message au jeu
+                    self.message_callback(message)
+                    
+                except json.JSONDecodeError:
+                    print("JSON invalide reçu")
+                    continue
+        except (ConnectionRefusedError, OSError) as e:
+            self.connected = False
+            self.message_callback({"type": "connection_error", "message": f"Could not connect to server: {e}"})
+        finally:
+            if self.writer and not self.writer.is_closing():
+                self.writer.close()
+                await self.writer.wait_closed()
+            
+            self.connected = False
     
-    def fire_shot(self, row, col):
-        """Send a shot with row and column coordinates"""
-        return self.send_message(f"FIRE {row} {col}|")  # Note the space separator
+    async def _process_queue(self):
+        """Process outgoing message queue"""
+        while self.connected:
+            try:
+                # Non-blocking queue check with small sleep
+                try:
+                    message = self.message_queue.get_nowait()
+                    print(f"Envoi du message: {message}")  # Debug
+                    self.writer.write(json.dumps(message).encode() + b'\n')
+                    await self.writer.drain()
+                    self.message_queue.task_done()
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Error sending message: {e}")
     
-    def get_message(self):
-        """Get next message from queue"""
-        if self.messages:
-            return self.messages.pop(0)
-        return None
+    def send_message(self, message):
+        """Queue a message to be sent to the server"""
+        if self.connected:
+            self.message_queue.put(message)
+            return True
+        return False
     
-    def is_connected(self):
-        return self.connected
+    def disconnect(self):
+        """Disconnect from the server"""
+        if self.connected:
+            self.connected = False
+            
+            # Clean up in the event loop thread
+            if self.event_loop and self.writer:
+                asyncio.run_coroutine_threadsafe(self._close_writer(), self.event_loop)
+    
+    async def _close_writer(self):
+        """Close the writer connection"""
+        if self.writer and not self.writer.is_closing():
+            self.writer.close()
+            await self.writer.wait_closed()
