@@ -1,231 +1,324 @@
-import socket
-import threading
-import time
-import select
+import asyncio
+import json
 import random
+import logging
 
-class SimpleServer:
-    def __init__(self, host='0.0.0.0', port=5555):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('BattleshipServer')
+
+class GameSession:
+    def __init__(self, player1, player2, session_id):
+        self.player1 = player1
+        self.player2 = player2
+        self.session_id = session_id
+        self.current_player = 1
+        self.game_state = "SETUP"  # SETUP, GAMEPLAY, GAME_OVER
+        self.setup_complete = [False, False]
+        
+    async def start(self):
+        """Initialize the game session and notify players"""
+        logger.info(f"Starting game session {self.session_id} with players {self.player1.name} and {self.player2.name}")
+        
+        # Send session info to both players
+        await self.player1.send_message({
+            "type": "session_start", 
+            "session_id": self.session_id,
+            "player_num": 1,
+            "opponent": self.player2.name
+        })
+        
+        await self.player2.send_message({
+            "type": "session_start", 
+            "session_id": self.session_id,
+            "player_num": 2,
+            "opponent": self.player1.name
+        })
+        
+        # Set game to setup phase
+        self.game_state = "SETUP"
+        logger.info(f"Session {self.session_id} started, waiting for players to complete setup")
+        
+    async def handle_setup_complete(self, player_num):
+        """Handle when a player completes setup"""
+        self.setup_complete[player_num - 1] = True
+        
+        # Notify both players about setup status
+        await self.broadcast_message({
+            "type": "setup_update",
+            "player": player_num,
+            "ready": True
+        })
+        
+        # If both players are ready, start gameplay
+        if all(self.setup_complete):
+            self.game_state = "GAMEPLAY"
+            self.current_player = 1
+            await self.broadcast_message({
+                "type": "gameplay_start",
+                "current_player": self.current_player
+            })
+    
+    async def handle_shot(self, player_num, row, col, result=None):
+        """Process a shot and update game state"""
+        # Validation que c'est bien le tour du joueur
+        if player_num != self.current_player:
+            logger.warning(f"Player {player_num} tried to shoot out of turn (current={self.current_player})")
+            return
+        
+        # Déterminer le joueur cible
+        target_player = self.player2 if player_num == 1 else self.player1
+        
+        # Envoyer l'information de tir au joueur cible pour traitement
+        await target_player.send_message({
+            "type": "receive_shot",
+            "row": row,
+            "col": col,
+            "player": player_num
+        })
+        
+        logger.info(f"Player {player_num} shot at ({row}, {col}), waiting for result")
+        
+        # Si le résultat est fourni (peut arriver dans certaines implémentations)
+        if result:
+            await self.handle_shot_result(player_num, row, col, result)
+
+    async def handle_shot_result(self, player_num, row, col, result):
+        """Handle the result of a shot"""
+        await self.broadcast_message({
+            "type": "shot_result",
+            "player": player_num,
+            "row": row,
+            "col": col,
+            "result": result
+        })
+        
+        # Si c'est un miss, c'est au tour de l'autre joueur
+        if result == "miss":
+            self.current_player = 3 - self.current_player  # Alterne entre 1 et 2
+            await self.broadcast_message({
+                "type": "turn_change",
+                "current_player": self.current_player
+            })
+            logger.info(f"Turn changed to player {self.current_player}")
+    
+    async def broadcast_message(self, message):
+        """Send a message to both players"""
+        await self.player1.send_message(message)
+        await self.player2.send_message(message)
+    
+    async def handle_disconnect(self, player):
+        """Handle a player disconnection"""
+        logger.info(f"Player {player.name} disconnected from session {self.session_id}")
+        
+        # Notify the other player
+        other_player = self.player2 if player == self.player1 else self.player1
+        await other_player.send_message({
+            "type": "opponent_disconnected"
+        })
+
+    async def handle_ship_placement(self, player_num, ship_data):
+        """Sync ship placement between players"""
+        logger.info(f"Player {player_num} placed a ship: {ship_data['name']}")
+        
+        # Déterminer le joueur cible (l'adversaire)
+        target_player = self.player2 if player_num == 1 else self.player1
+        
+        # Transférer l'information de placement à l'autre joueur
+        await target_player.send_message({
+            "type": "opponent_ship_placement", 
+            "ship": ship_data
+        })
+
+class Player:
+    def __init__(self, name, writer, reader):
+        self.name = name
+        self.writer = writer
+        self.reader = reader
+        self.session = None
+        
+    async def send_message(self, message):
+        """Send a JSON message to the client"""
+        try:
+            self.writer.write(json.dumps(message).encode() + b'\n')
+            await self.writer.drain()
+        except Exception as e:
+            logger.error(f"Error sending message to {self.name}: {e}")
+    
+    def disconnect(self):
+        """Disconnect the player"""
+        if not self.writer.is_closing():
+            self.writer.close()
+
+class BattleshipServer:
+    def __init__(self, host='0.0.0.0', port=8888):
         self.host = host
         self.port = port
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Add TCP keepalive
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        self.server.bind((self.host, self.port))
-        self.clients = []
-        self.game_state = {"ships": [{}, {}], "turn": 0}
-        self.running = True
-        
-    def start(self):
-        self.server.listen(2)
-        print(f"Server started on {self.host}:{self.port}")
-        
-        # Accept exactly 2 players
-        while len(self.clients) < 2 and self.running:
-            try:
-                # Use select with timeout to make this interruptible
-                readable, _, _ = select.select([self.server], [], [], 1.0)
-                if not readable:
-                    continue
-                    
-                client, address = self.server.accept()
-                # Set keepalive for client socket
-                client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                # Set a longer timeout for operations
-                client.settimeout(30.0)  # 30 second timeout
-                
-                player_id = len(self.clients)
-                self.clients.append({"socket": client, "address": address, "id": player_id})
-                print(f"Player {player_id+1} connected from {address}")
-                
-                # Start a thread for this client
-                thread = threading.Thread(target=self.handle_client, args=(client, player_id))
-                thread.daemon = True
-                thread.start()
-                
-                # Send player ID with error handling
-                try:
-                    client.send(f"PLAYER|{player_id}".encode())
-                    # Small delay to ensure message is received
-                    time.sleep(0.1)
-                except Exception as e:
-                    print(f"Error sending player ID: {e}")
-                
-                # If 2 players, start game
-                if len(self.clients) == 2:
-                    print("Game is starting with 2 players")
-                    time.sleep(0.5)  # Allow connections to stabilize
-                    self.broadcast("START|0")
-            except Exception as e:
-                print(f"Error in connection: {e}")
-        
-        print("Server running with 2 players")
+        self.players = {}  # Maps name to Player object
+        self.waiting_players = []  # Players waiting for a match
+        self.sessions = {}  # Maps session_id to GameSession
+        self.next_session_id = 1
     
-    def handle_client(self, client, player_id):
-        buffer = ""
+    async def start_server(self):
+        """Start the server"""
+        server = await asyncio.start_server(
+            self.handle_client, self.host, self.port)
+        
+        addr = server.sockets[0].getsockname()
+        logger.info(f"Server running on {addr}")
+        
+        async with server:
+            await server.serve_forever()
+    
+    async def handle_client(self, reader, writer):
+        """Handle a new client connection"""
+        addr = writer.get_extra_info('peername')
+        logger.info(f"New connection from {addr}")
+        
+        # First message should be player name
         try:
-            while self.running:
-                try:
-                    # Use select for non-blocking reads with timeout
-                    readable, _, _ = select.select([client], [], [], 5.0)
-                    if not readable:
-                        # Send a keep-alive ping periodically
-                        try:
-                            client.send("PING|".encode())
-                        except:
-                            break
-                        continue
-                    
-                    # Receive data with timeout protection
-                    chunk = client.recv(1024).decode()
-                    if not chunk:
-                        print(f"Client {player_id+1} disconnected (empty data)")
-                        break
-                    
-                    # Add to buffer and check for complete messages
-                    buffer += chunk
-                    
-                    # Process any complete messages
-                    while '|' in buffer:
-                        message, buffer = buffer.split('|', 1)
-                        if not message:  # Skip empty messages
-                            continue
-                            
-                        print(f"From player {player_id+1}: {message}")
-                        
-                        if message == "SHIPS":
-                            # Save player's ships (simplified)
-                            self.game_state["ships"][player_id] = "placed"
-                            print(f"Player {player_id+1} placed ships")
-                            
-                            # Check if both players placed ships
-                            if self.game_state["ships"][0] and self.game_state["ships"][1]:
-                                print("Both players placed ships - game starting")
-                                # Decide which player goes first (we'll set it to player 0 initially)
-                                self.game_state["turn"] = 0
-                                # Send clear game start message with first player information
-                                self.broadcast(f"GAMESTART|{self.game_state['turn']}")
-                            else:
-                                # Tell this player to wait for the other player
-                                client.send("WAIT|".encode())
-                                
-                                # Tell the other player it's their turn to place ships
-                                other_player = 1 if player_id == 0 else 0
-                                if other_player < len(self.clients) and self.clients[other_player]:
-                                    try:
-                                        self.clients[other_player]["socket"].send("YOURPLACEMENT|".encode())
-                                    except:
-                                        pass
-                        
-                        elif message.startswith("FIRE"):
-                            # Handle a shot with actual coordinates from message
-                            parts = message.split(' ')
-                            if len(parts) >= 3:
-                                try:
-                                    row = int(parts[1])
-                                    col = int(parts[2])
-                                    
-                                    # Only allow if it's player's turn
-                                    if self.game_state["turn"] != player_id:
-                                        client.send("ERROR|Not your turn".encode())
-                                        continue
-                                        
-                                    # Process shot against the opponent's board
-                                    target_player = 1 if player_id == 0 else 0
-                                    
-                                    # Simple hit detection for testing
-                                    # In a real implementation, this would check the opponent's ship positions
-                                    hit_chance = 0.4  # 40% chance of hit for testing
-                                    if random.random() < hit_chance:
-                                        result = "HIT"
-                                    else:
-                                        result = "MISS"
-                                    
-                                    # Switch turn
-                                    self.game_state["turn"] = target_player
-                                    
-                                    # Broadcast result to both players
-                                    self.broadcast(f"SHOT|{player_id}|{row}|{col}|{result}")
-                                    print(f"Player {player_id+1} fired at ({row},{col}): {result}")
-                                except ValueError:
-                                    client.send("ERROR|Invalid coordinates".encode())
-                            else:
-                                client.send("ERROR|Missing coordinates".encode())
-                        
-                        elif message == "PONG":
-                            # Heartbeat response, do nothing
-                            pass
-                        
-                except socket.timeout:
-                    # Socket timeout, send heartbeat
-                    try:
-                        client.send("PING|".encode())
-                    except:
-                        break
-                except ConnectionResetError:
-                    print(f"Connection reset by client {player_id+1}")
-                    break
-                except ConnectionAbortedError:
-                    print(f"Connection aborted by client {player_id+1}")
-                    break
-                except Exception as e:
-                    print(f"Error handling client {player_id+1}: {e}")
-                    break
-        finally:
-            # Client disconnected - clean up
-            print(f"Player {player_id+1} disconnected")
-            try:
-                client.close()
-            except:
-                pass
-                
-            # Mark player as disconnected in our list
-            for i, c in enumerate(self.clients):
-                if c["id"] == player_id:
-                    self.clients[i] = None
-                    
-            # Filter out None values
-            self.clients = [c for c in self.clients if c is not None]
+            data = await reader.readline()
+            name_message = json.loads(data.decode())
             
-            # Notify remaining players
-            self.broadcast(f"QUIT|{player_id}")
+            if 'name' not in name_message:
+                logger.error(f"No name provided by client {addr}")
+                writer.close()
+                return
+            
+            name = name_message['name']
+            
+            # Check if name is unique
+            if name in self.players:
+                await self.send_message(writer, {
+                    "type": "error",
+                    "message": "Name already taken"
+                })
+                writer.close()
+                return
+            
+            # Create new player
+            player = Player(name, writer, reader)
+            self.players[name] = player
+            logger.info(f"Player {name} connected")
+            
+            # Add to waiting queue or match with waiting player
+            if self.waiting_players:
+                opponent = self.waiting_players.pop(0)
+                logger.info(f"Matching {player.name} with waiting player {opponent.name}")
+                await self.create_game_session(player, opponent)
+            else:
+                self.waiting_players.append(player)
+                logger.info(f"Player {player.name} added to waiting queue. Waiting players: {len(self.waiting_players)}")
+                await player.send_message({
+                    "type": "waiting_for_opponent"
+                })
+            
+            # Process client messages
+            await self.process_messages(player)
+            
+        except Exception as e:
+            logger.error(f"Error handling client {addr}: {e}")
+        finally:
+            writer.close()
     
-    def broadcast(self, message):
-        print(f"Broadcasting: {message}")
-        for client in self.clients:
-            if client is None:
-                continue
-            try:
-                # Make sure all messages end with a pipe character
-                if not message.endswith('|'):
-                    message += '|'
-                client["socket"].send(message.encode())
-            except Exception as e:
-                print(f"Error broadcasting to client {client['id']+1}: {e}")
+    async def create_game_session(self, player1, player2):
+        """Create a new game session between two players"""
+        session_id = self.next_session_id
+        self.next_session_id += 1
+        
+        session = GameSession(player1, player2, session_id)
+        self.sessions[session_id] = session
+        
+        player1.session = session
+        player2.session = session
+        
+        await session.start()
     
-    def close(self):
-        self.running = False
-        time.sleep(1)  # Give time for threads to notice running=False
-        for client in self.clients:
-            if client is None:
-                continue
-            try:
-                client["socket"].close()
-            except:
-                pass
-        self.server.close()
-        print("Server closed")
+    async def process_messages(self, player):
+        """Process incoming messages from a player"""
+        try:
+            while True:
+                data = await player.reader.readline()
+                if not data:  # Client disconnected
+                    break
+                
+                message = json.loads(data.decode())
+                await self.handle_message(player, message)
+                
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error processing messages for {player.name}: {e}")
+        finally:
+            # Handle disconnection
+            if player.name in self.players:
+                del self.players[player.name]
+            
+            if player in self.waiting_players:
+                self.waiting_players.remove(player)
+            
+            if player.session:
+                await player.session.handle_disconnect(player)
+            
+            player.disconnect()
+    
+    async def handle_message(self, player, message):
+        """Process a message from a player"""
+        message_type = message.get('type')
+        
+        if not player.session:
+            logger.warning(f"Received message from player without a session: {player.name}")
+            return
+        
+        session = player.session
+        
+        if message_type == "setup_complete":
+            player_num = message.get('player_num')
+            await session.handle_setup_complete(player_num)
+            
+        elif message_type == "shot":
+            player_num = message.get('player_num')
+            row = message.get('row')
+            col = message.get('col')
+            result = message.get('result')
+            await session.handle_shot(player_num, row, col, result)
+            
+        elif message_type == "shot_result":
+            player_num = message.get('player_num')
+            row = message.get('row')
+            col = message.get('col')
+            result = message.get('result')
+            await session.handle_shot_result(player_num, row, col, result)
+            
+        elif message_type == "ship_placement":
+            player_num = message.get('player_num')
+            ship_data = message.get('ship')
+            await session.handle_ship_placement(player_num, ship_data)
+            
+        elif message_type == "chat":
+            # Handle chat messages
+            text = message.get('text', '')
+            await session.broadcast_message({
+                "type": "chat",
+                "player": player.name,
+                "text": text
+            })
+        
+        else:
+            logger.warning(f"Unknown message type: {message_type}")
+    
+    async def send_message(self, writer, message):
+        """Send a JSON message to a client"""
+        writer.write(json.dumps(message).encode() + b'\n')
+        await writer.drain()
 
 if __name__ == "__main__":
-    server = SimpleServer()
-    try:
-        print("Simple Battleship server starting...")
-        server.start()
-        # Keep server running
-        while server.running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Server shutting down...")
-    finally:
-        server.close()
+    server = BattleshipServer()
+    asyncio.run(server.start_server())
+
+# Dans handle_network_message du client, ajoutez des logs explicites pour le débogage:
+def handle_network_message(self, message):
+    """Process messages from the server"""
+    message_type = message.get("type")
+    print(f"[DEBUG] Reçu message: {message_type} - {message}")  # Plus détaillé
+    
+    # Reste du code...
