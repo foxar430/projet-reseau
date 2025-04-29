@@ -703,6 +703,13 @@ class Game:
                 board = self.board2
                 remaining_ships = self.remaining_ships2
         
+        # Calculer la position du panneau latéral (comme dans draw_setup)
+        is_left_board = (board == self.board1)
+        if is_left_board:
+            sidebar_x = board.x + (CELL_SIZE * GRID_SIZE) + 50
+        else:
+            sidebar_x = 50
+        
         # Check if any setup buttons were clicked
         for button in self.setup_buttons:
             if button.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, 
@@ -773,8 +780,8 @@ class Game:
                     self.message = "Cannot place ship here!"
                     self.message_timer = 2000
         
-        # Check if ship selection buttons were clicked
-        if 800 <= pos[0] <= 950:
+        # Check if ship selection buttons were clicked - UTILISER sidebar_x AU LIEU DE 800
+        if sidebar_x <= pos[0] <= sidebar_x + 150:
             for i, ship in enumerate(remaining_ships):
                 if 150 + i * 50 <= pos[1] <= 190 + i * 50:
                     self.selected_ship = ship
