@@ -5,10 +5,10 @@ import time
 import os
 from lo3ba_ai import BattleshipAI
 
-# Initialize Pygame
+
 pygame.init()
 
-# Constants
+
 SCREEN_WIDTH = 1000
 SCREEN_HEIGHT = 700
 GRID_SIZE = 10
@@ -16,7 +16,7 @@ CELL_SIZE = 40
 GRID_PADDING = 50
 FONT_SIZE = 24
 
-# Enhanced Colors
+
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 GRAY = (200, 200, 200)
@@ -29,10 +29,10 @@ YELLOW = (255, 215, 0)
 NAVY = (0, 0, 80)
 OCEAN = (65, 105, 225)
 LIGHT_GRAY = (220, 220, 220)
-ORANGE = (255, 165, 0)  # Used for sunk ship indicators
-SOFT_RED = (255, 100, 100)  # Softer red for sunk ships
+ORANGE = (255, 165, 0)  
+SOFT_RED = (255, 100, 100)  
 
-# Game State
+
 MENU = 0
 SETUP = 1
 GAMEPLAY = 2
@@ -147,10 +147,10 @@ class Board:
         self.hover_cell = None
     
     def place_ship(self, ship, row, col, horizontal):
-        # Reset ship's existing coordinates
+        
         ship.coordinates = []
         
-        # Check if ship can be placed
+        
         if horizontal:
             if col + ship.size > self.size:
                 return False
@@ -158,7 +158,7 @@ class Board:
                 if self.grid[row][col + i] != '~':
                     return False
             
-            # Place ship
+            
             for i in range(ship.size):
                 self.grid[row][col + i] = 'O'
                 ship.coordinates.append((row, col + i))
@@ -169,7 +169,7 @@ class Board:
                 if self.grid[row + i][col] != '~':
                     return False
             
-            # Place ship
+            
             for i in range(ship.size):
                 self.grid[row + i][col] = 'O'
                 ship.coordinates.append((row + i, col))
@@ -194,13 +194,12 @@ class Board:
         
         self.shots.add((row, col))
         
-        # Add animation at the shot location
         center_x = self.x + col * CELL_SIZE + CELL_SIZE // 2
         center_y = self.y + row * CELL_SIZE + CELL_SIZE // 2
         
         if self.grid[row][col] == 'O':
             self.grid[row][col] = 'X'
-            # Add hit animation
+            
             self.animations.append(Explosion(center_x, center_y, True))
             
             for ship in self.ships:
@@ -211,7 +210,7 @@ class Board:
                     return "hit"
         else:
             self.grid[row][col] = 'M'
-            # Add miss animation
+            
             self.animations.append(Explosion(center_x, center_y, False))
             return "miss"
     
@@ -219,10 +218,10 @@ class Board:
         return all(ship.sunk for ship in self.ships)
     
     def update(self, dt, mouse_pos=None):
-        # Update animations
+        
         self.animations = [anim for anim in self.animations if anim.update(dt)]
         
-        # Update hover cell
+        
         if mouse_pos:
             if (self.x <= mouse_pos[0] <= self.x + self.size * CELL_SIZE and
                 self.y <= mouse_pos[1] <= self.y + self.size * CELL_SIZE):
@@ -235,19 +234,19 @@ class Board:
             self.hover_cell = None
     
     def draw(self, screen, hide_ships=False, selected_ship=None, is_horizontal=True):
-        # Draw water background with subtle pattern
+        
         water_rect = pygame.Rect(self.x - 5, self.y - 5, 
                                self.size * CELL_SIZE + 10, self.size * CELL_SIZE + 10)
         pygame.draw.rect(screen, OCEAN, water_rect, border_radius=5)
         
-        # Draw subtle wave lines
+        
         for i in range(0, self.size * CELL_SIZE, 10):
             alpha = random.randint(20, 60)
             wave_surf = pygame.Surface((self.size * CELL_SIZE, 3), pygame.SRCALPHA)
             pygame.draw.line(wave_surf, (255, 255, 255, alpha), (0, 1), (self.size * CELL_SIZE, 1), 2)
             screen.blit(wave_surf, (self.x, self.y + i))
 
-        # Draw grid
+        
         for row in range(self.size):
             for col in range(self.size):
                 rect = pygame.Rect(
@@ -258,11 +257,11 @@ class Board:
                 pygame.draw.rect(screen, LIGHT_BLUE, rect)
                 pygame.draw.rect(screen, GRAY, rect, 1)
                 
-                # Draw ships, hits and misses
+                
                 if (row, col) in self.shots:
                     if self.grid[row][col] == 'X':
-                        # Hit
-                        # Draw hit effect
+                        
+                        
                         pygame.draw.circle(
                             screen, RED,
                             (self.x + col * CELL_SIZE + CELL_SIZE // 2,
@@ -270,7 +269,7 @@ class Board:
                             CELL_SIZE // 3
                         )
                         
-                        # Draw X mark
+                        
                         pygame.draw.line(
                             screen, BLACK,
                             (self.x + col * CELL_SIZE + 10, self.y + row * CELL_SIZE + 10),
@@ -282,7 +281,7 @@ class Board:
                             (self.x + col * CELL_SIZE + 10, 
                              self.y + row * CELL_SIZE + CELL_SIZE - 10), 2)
                     elif self.grid[row][col] == 'M':
-                        # Miss
+                        
                         pygame.draw.circle(
                             screen, WHITE,
                             (self.x + col * CELL_SIZE + CELL_SIZE // 2,
@@ -296,11 +295,11 @@ class Board:
                             CELL_SIZE // 4, 1
                         )
         
-        # Draw ships with special rendering for sunk ships
+        
         if not hide_ships:
             for ship in self.ships:
-                # Find the top-left corner of the ship
-                if len(ship.coordinates) > 0:  # Only if ship is placed
+                
+                if len(ship.coordinates) > 0:  
                     if ship.horizontal:
                         start_row = ship.coordinates[0][0]
                         start_col = min(c for r, c in ship.coordinates)
@@ -316,19 +315,19 @@ class Board:
                                 self.y + start_row * CELL_SIZE, 
                                 CELL_SIZE)
         
-        # For gameplay, highlight sunk ships
+        
         for ship in self.ships:
             if ship.sunk:
-                # Add a special marker for sunk ships
+                
                 for row, col in ship.coordinates:
-                    # Draw a distinctive marker to indicate a sunk ship part
+                    
                     rect_center = (
                         self.x + col * CELL_SIZE + CELL_SIZE // 2,
                         self.y + row * CELL_SIZE + CELL_SIZE // 2
                     )
                     
-                    # Draw orange outline for sunk ship cells only if ships aren't hidden
-                    # Or if it's a shot location (the player has already hit this spot)
+                    
+                    
                     if not hide_ships or (row, col) in self.shots:
                         sunk_rect = pygame.Rect(
                             self.x + col * CELL_SIZE + 2, 
@@ -337,17 +336,17 @@ class Board:
                         )
                         pygame.draw.rect(screen, ORANGE, sunk_rect, 2, border_radius=3)
                     
-                    # Draw sunk indicator text "✓" only for visible ships
+                    
                     if not hide_ships:
                         small_font = pygame.font.Font(None, 28)
                         sunk_text = small_font.render("✓", True, ORANGE)
                         text_rect = sunk_text.get_rect(center=rect_center)
                         screen.blit(sunk_text, text_rect)
         
-        # Draw hover effect for ship placement
+        
         if self.hover_cell and selected_ship:
             row, col = self.hover_cell
-            # Check if ship can be placed
+            
             can_place = True
             cells_to_highlight = []
             
@@ -370,7 +369,7 @@ class Board:
                 else:
                     can_place = False
             
-            # Draw placement preview
+            
             for cell_row, cell_col in cells_to_highlight:
                 rect = pygame.Rect(
                     self.x + cell_col * CELL_SIZE, 
@@ -378,33 +377,33 @@ class Board:
                     CELL_SIZE, CELL_SIZE
                 )
                 placement_color = (0, 255, 0, 100) if can_place else (255, 0, 0, 100)
-                # Create transparent surface
+                
                 s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
                 s.fill(placement_color)
                 screen.blit(s, rect)
         
-        # Draw row and column labels with better styling
+        
         font = pygame.font.Font(None, FONT_SIZE)
         label_bg = (200, 200, 220, 180)
         
         for i in range(self.size):
-            # Draw row labels (1-10)
+            
             row_label = font.render(str(i+1), True, BLACK)
             label_rect = pygame.Rect(self.x - 25, self.y + i * CELL_SIZE + CELL_SIZE // 3 - 5, 20, 20)
             pygame.draw.rect(screen, label_bg, label_rect, border_radius=3)
             screen.blit(row_label, (self.x - 22, self.y + i * CELL_SIZE + CELL_SIZE // 3 - 2))
             
-            # Draw column labels (A-J)
+            
             col_label = font.render(chr(65 + i), True, BLACK)
             label_rect = pygame.Rect(self.x + i * CELL_SIZE + CELL_SIZE // 3 - 5, self.y - 25, 20, 20)
             pygame.draw.rect(screen, label_bg, label_rect, border_radius=3)
             screen.blit(col_label, (self.x + i * CELL_SIZE + CELL_SIZE // 3 - 2, self.y - 22))
         
-        # Draw animations
+        
         for anim in self.animations:
             anim.draw(screen)
         
-        # Draw board outline
+        
         board_rect = pygame.Rect(self.x - 5, self.y - 5, 
                                self.size * CELL_SIZE + 10, self.size * CELL_SIZE + 10)
         pygame.draw.rect(screen, NAVY, board_rect, 3, border_radius=5)
@@ -423,22 +422,21 @@ class Button:
         self.is_hovered = self.rect.collidepoint(mouse_pos)
     
     def draw(self, screen, font):
-        # Draw button with a 3D effect
+        
         color = self.hover_color if self.is_hovered else self.color
         
-        # Button body with rounded corners
+        
         pygame.draw.rect(screen, color, self.rect, 0, border_radius=8)
         
-        # Bottom shadow for 3D effect (use dark gray instead of alpha)
         shadow_rect = pygame.Rect(self.rect.x + 2, self.rect.y + 2, 
                                 self.rect.width, self.rect.height)
         pygame.draw.rect(screen, (50, 50, 50), shadow_rect, 0, border_radius=8)
         pygame.draw.rect(screen, color, self.rect, 0, border_radius=8)
         
-        # Border
+        
         pygame.draw.rect(screen, BLACK, self.rect, 2, border_radius=8)
         
-        # Button text with enhanced visibility
+        
         text_surf = font.render(self.text, True, self.text_color)
         text_rect = text_surf.get_rect(center=self.rect.center)
         screen.blit(text_surf, text_rect)
@@ -975,72 +973,86 @@ class Game:
         self.screen.blit(title_shadow, (SCREEN_WIDTH // 2 - title_text.get_width() // 2 + 1, 11))
         self.screen.blit(title_text, (SCREEN_WIDTH // 2 - title_text.get_width() // 2, 10))
         
-        # Draw board with current player's selection
         mouse_pos = pygame.mouse.get_pos()
         
-        # Update and draw the active player's board for setup
         board.update(self.clock.get_time(), mouse_pos)
         board.draw(self.screen, hide_ships=False, selected_ship=self.selected_ship, 
                  is_horizontal=self.ship_horizontal)
         
-        # Draw ship selection sidebar
-        pygame.draw.rect(self.screen, LIGHT_BLUE, (800, 100, 150, 400), 0, border_radius=8)
-        pygame.draw.rect(self.screen, NAVY, (800, 100, 150, 400), 2, border_radius=8)
-        ship_select_text = self.font.render("Select Ship:", True, BLACK)
-        self.screen.blit(ship_select_text, (825, 110))
+        # Déterminer si c'est le plateau de gauche ou de droite et positionner le panneau en conséquence
+        is_left_board = (board == self.board1)
         
-        # Draw available ships
+        # Calculer la position du panneau latéral
+        if is_left_board:
+            # Si c'est le plateau de gauche, positionner le panneau à droite du plateau
+            sidebar_x = board.x + (CELL_SIZE * GRID_SIZE) + 50  # 50px de marge
+        else:
+            # Si c'est le plateau de droite, positionner le panneau à l'extrémité gauche
+            sidebar_x = 50  # 50px de la bordure gauche de l'écran
+        
+        # Draw ship selection sidebar à la nouvelle position
+        pygame.draw.rect(self.screen, LIGHT_BLUE, (sidebar_x, 100, 150, 400), 0, border_radius=8)
+        pygame.draw.rect(self.screen, NAVY, (sidebar_x, 100, 150, 400), 2, border_radius=8)
+        ship_select_text = self.font.render("Select Ship:", True, BLACK)
+        self.screen.blit(ship_select_text, (sidebar_x + 25, 110))
+        
+        # Draw available ships avec la nouvelle position
         for i, ship in enumerate(remaining_ships):
             is_selected = self.selected_ship == ship
-            ship.draw(self.screen, 825, 150 + i * 50, 20, is_selected)
+            ship.draw(self.screen, sidebar_x + 25, 150 + i * 50, 20, is_selected)
             ship_name = self.font.render(ship.name, True, BLACK)
-            self.screen.blit(ship_name, (825 + ship.size * 20 + 10, 160 + i * 50))
+            self.screen.blit(ship_name, (sidebar_x + 25 + ship.size * 20 + 10, 160 + i * 50))
         
-        # Draw setup buttons (rotate & random)
+        # Draw setup buttons (rotate & random) avec la nouvelle position
+        self.setup_buttons[0].rect.x = sidebar_x + 25  # Bouton Rotate
+        self.setup_buttons[0].rect.y = 350  # Maintenir la position Y
+        self.setup_buttons[1].rect.x = sidebar_x + 25  # Bouton Random
+        self.setup_buttons[1].rect.y = 450  # Maintenir la position Y
+        
         for button in self.setup_buttons:
             button.draw(self.screen, self.font)
         
-        # Show rotation indicator
+        # Afficher l'orientation avec la nouvelle position
         orientation = "Horizontal" if self.ship_horizontal else "Vertical"
         orientation_text = self.font.render(f"Orientation: {orientation}", True, BLACK)
-        self.screen.blit(orientation_text, (825, 500))
+        self.screen.blit(orientation_text, (sidebar_x + 25, 500))
     
     def draw_gameplay(self):
-        # Déterminer quel texte afficher pour le tour actuel
+        
         if self.is_online_game:
-            # En mode en ligne, afficher clairement de qui est le tour
+            
             if self.current_player == self.online_player_num:
                 current_text = self.big_font.render("YOUR TURN", True, GREEN)
             else:
                 current_text = self.big_font.render(f"{self.opponent_name}'S TURN", True, RED)
                 
-            # Déterminer quels plateaux afficher
+            
             my_board = self.board1 if self.online_player_num == 1 else self.board2
             opponent_board = self.board2 if self.online_player_num == 1 else self.board1
             
-            # Mise à jour des plateaux (hover effects)
+            
             if self.current_player == self.online_player_num:
-                # Quand c'est mon tour, je vise le plateau adverse
+                
                 my_board.update(self.clock.get_time())
                 opponent_board.update(self.clock.get_time(), self.mouse_pos)
             else:
-                # Quand c'est le tour de l'adversaire, aucun hover effect
+                
                 my_board.update(self.clock.get_time())
                 opponent_board.update(self.clock.get_time())
             
-            # Dessiner les étiquettes
+            
             my_label = self.font.render("YOUR BOARD", True, NAVY)
             opp_label = self.font.render(f"{self.opponent_name}'S BOARD", True, NAVY)
             
-            # Afficher les étiquettes
+            
             self.screen.blit(my_label, (my_board.x + my_board.size * CELL_SIZE // 2 - my_label.get_width() // 2, my_board.y - 40))
             self.screen.blit(opp_label, (opponent_board.x + opponent_board.size * CELL_SIZE // 2 - opp_label.get_width() // 2, opponent_board.y - 40))
             
-            # Dessiner les plateaux - toujours afficher mes navires, jamais ceux de l'adversaire
-            my_board.draw(self.screen, hide_ships=False)  # Mes navires sont toujours visibles
-            opponent_board.draw(self.screen, hide_ships=True)  # Les navires adverses sont toujours cachés
             
-            # Dessiner l'affichage de statut des navires
+            my_board.draw(self.screen, hide_ships=False)  
+            opponent_board.draw(self.screen, hide_ships=True)  
+            
+            
             if self.online_player_num == 1:
                 self.status_display1.draw(self.screen, self.font, self.ships1, opponent=False)
                 self.status_display2.draw(self.screen, self.font, self.ships2, opponent=True)
@@ -1048,25 +1060,15 @@ class Game:
                 self.status_display1.draw(self.screen, self.font, self.ships1, opponent=True)
                 self.status_display2.draw(self.screen, self.font, self.ships2, opponent=False)
         else:
-            # Mode local ou IA - conserver le comportement existant
+            
             if self.is_ai_game:
                 current_text = self.big_font.render("Your Turn" if self.current_player == 1 else "AI's Turn", True, RED)
+                self.board1.draw(self.screen, hide_ships=False)  # Player's ships always visible
+                self.board2.draw(self.screen, hide_ships=True)   # AI's ships always hidden
             else:
                 current_text = self.big_font.render(f"Player {self.current_player}'s Turn", True, RED)
-            
-            # Mise à jour des hover effects selon le joueur actuel
-            if self.current_player == 1:
-                # Quand c'est le tour du joueur 1, il cible le plateau du joueur 2
-                self.board1.update(self.clock.get_time())
-                self.board2.update(self.clock.get_time(), self.mouse_pos)
-            else:
-                # Quand c'est le tour du joueur 2, il cible le plateau du joueur 1
-                self.board1.update(self.clock.get_time(), self.mouse_pos)
-                self.board2.update(self.clock.get_time())
-            
-            # Dessiner les plateaux avec visibilité des navires selon le joueur actuel
-            self.board1.draw(self.screen, hide_ships=self.current_player == 2)
-            self.board2.draw(self.screen, hide_ships=self.current_player == 1)
+                self.board1.draw(self.screen, hide_ships=self.current_player == 2)
+                self.board2.draw(self.screen, hide_ships=self.current_player == 1)
             
             # Dessiner l'affichage de statut des navires
             self.status_display1.draw(self.screen, self.font, self.ships1, opponent=self.current_player == 2)
